@@ -1,7 +1,7 @@
 
 [package]
 edition = "2024"
-name = "test"
+name = "rp2350-keymouse-bridge-firmware"
 version = "0.1.0"
 license = "MIT or Apache-2.0"
 

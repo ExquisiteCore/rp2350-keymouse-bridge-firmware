@@ -922,8 +922,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rp2350-keymouse-bridge-firmware",
  "serialport",
- "test",
 ]
 
 [[package]]
@@ -1442,6 +1442,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rp2350-keymouse-bridge-firmware"
+version = "0.1.0"
+dependencies = [
+ "cortex-m-rt",
+ "defmt 1.1.0",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-rp",
+ "embassy-time",
+ "embassy-usb",
+ "panic-probe",
+ "static_cell",
+ "usbd-hid",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1671,23 +1688,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "test"
-version = "0.1.0"
-dependencies = [
- "cortex-m-rt",
- "defmt 1.1.0",
- "defmt-rtt",
- "embassy-executor",
- "embassy-futures",
- "embassy-rp",
- "embassy-time",
- "embassy-usb",
- "panic-probe",
- "static_cell",
- "usbd-hid",
 ]
 
 [[package]]

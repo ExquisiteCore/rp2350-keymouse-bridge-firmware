@@ -1,6 +1,6 @@
 [submodule "sdk/cpp"]
 	path = sdk/cpp
-	url = git@github.com:ExquisiteCore/rp2350-hid-bridge-cpp.git
+	url = https://github.com/ExquisiteCore/rp2350-hid-bridge-cpp.git
 [submodule "sdk/python"]
 	path = sdk/python
-	url = git@github.com:ExquisiteCore/rp2350-hid-bridge-python.git
+	url = https://github.com/ExquisiteCore/rp2350-hid-bridge-python.git
