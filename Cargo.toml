@@ -1,0 +1,19 @@
+
+[package]
+edition = "2024"
+name = "test"
+version = "0.1.0"
+license = "MIT or Apache-2.0"
+
+[target."thumbv8m.main-none-eabihf".dependencies]
+cortex-m-rt = "0.7"
+defmt = "1"
+defmt-rtt = "1"
+embassy-executor = { version = "0.10.0", features = ["defmt", "executor-thread", "platform-cortex-m"] }
+embassy-futures = "0.1.2"
+embassy-rp = { version = "0.10.0", features = ["critical-section-impl", "defmt", "rp235xb", "rt", "time-driver"] }
+embassy-time = { version = "0.5.1", features = ["defmt"] }
+embassy-usb = { version = "0.6.0", features = ["defmt", "max-handler-count-4", "max-interface-count-4"] }
+panic-probe = { version = "1", features = ["print-defmt"] }
+static_cell = "2.1.1"
+usbd-hid = { version = "0.10.0", features = ["defmt"] }

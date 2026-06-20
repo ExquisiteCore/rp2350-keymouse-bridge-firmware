@@ -1,0 +1,6 @@
+# hidctl 脚本示例：只包含安全的基础动作。
+type "abc 123"
+key tap ENTER
+mouse move 10 -5
+wait 100
+stop

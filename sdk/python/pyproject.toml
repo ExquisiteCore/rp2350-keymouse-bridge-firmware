@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rp2350-hid-bridge"
+version = "0.1.0"
+description = "Python SDK for the RP2350 USB HID bridge"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rp2350_hid_bridge*"]

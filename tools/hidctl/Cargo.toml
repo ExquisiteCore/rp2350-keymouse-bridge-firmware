@@ -1,0 +1,11 @@
+[package]
+edition = "2024"
+name = "hidctl"
+version = "0.1.0"
+license = "MIT or Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6.1", features = ["derive"] }
+hid_protocol = { package = "test", path = "../.." }
+serialport = "4.9.0"

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RP2350 HID Control</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">USB HID Bridge</p>
+          <h1>RP2350 HID Control</h1>
+        </div>
+        <div class="connection-strip">
+          <span id="statusPill" class="status-pill disconnected">未连接</span>
+          <button id="connectBtn" class="primary-btn" type="button">连接</button>
+          <button id="disconnectBtn" class="ghost-btn" type="button" disabled>断开</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="panel protocol-panel">
+          <div class="panel-head">
+            <div>
+              <h2>协议</h2>
+              <p id="portLabel">等待串口授权</p>
+            </div>
+            <label class="arm-toggle">
+              <input id="armToggle" type="checkbox" />
+              <span>解锁 HID 动作</span>
+            </label>
+          </div>
+
+          <div class="command-row">
+            <button data-action="ping" class="tool-btn" type="button">Ping</button>
+            <button data-action="info" class="tool-btn" type="button">Info</button>
+            <button data-action="caps" class="tool-btn" type="button">Caps</button>
+            <button data-action="stop" class="danger-btn" type="button">Stop</button>
+          </div>
+
+          <div class="inline-form">
+            <label for="waitMs">等待</label>
+            <input id="waitMs" type="number" min="0" max="60000" value="100" />
+            <button data-action="wait" class="tool-btn" type="button">发送</button>
+          </div>
+
+          <div id="lastStatus" class="status-box">未收到状态</div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>键盘</h2>
+          </div>
+
+          <label class="field-block">
+            <span>ASCII 文本</span>
+            <textarea id="typeText" rows="4">hid webui ok</textarea>
+          </label>
+          <button data-action="type" class="wide-btn hid-action" type="button" disabled>发送文本</button>
+
+          <div class="split-form">
+            <label class="field-block">
+              <span>组合键</span>
+              <input id="keyCombo" value="CTRL+C" />
+            </label>
+            <div class="segmented">
+              <button data-key-action="tap" class="hid-action" type="button" disabled>Tap</button>
+              <button data-key-action="down" class="hid-action" type="button" disabled>Down</button>
+              <button data-key-action="up" class="hid-action" type="button" disabled>Up</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel mouse-panel">
+          <div class="panel-head">
+            <h2>鼠标</h2>
+          </div>
+
+          <div class="mouse-grid">
+            <button data-move="0,-20" class="icon-btn hid-action" type="button" disabled>↑</button>
+            <button data-move="-20,0" class="icon-btn hid-action" type="button" disabled>←</button>
+            <button data-move="20,0" class="icon-btn hid-action" type="button" disabled>→</button>
+            <button data-move="0,20" class="icon-btn hid-action" type="button" disabled>↓</button>
+          </div>
+
+          <div class="inline-form">
+            <label for="mouseDx">dx</label>
+            <input id="mouseDx" type="number" min="-32768" max="32767" value="20" />
+            <label for="mouseDy">dy</label>
+            <input id="mouseDy" type="number" min="-32768" max="32767" value="0" />
+            <button data-action="mouseMove" class="tool-btn hid-action" type="button" disabled>移动</button>
+          </div>
+
+          <div class="button-grid">
+            <button data-click="left" class="hid-action" type="button" disabled>左键</button>
+            <button data-click="right" class="hid-action" type="button" disabled>右键</button>
+            <button data-click="middle" class="hid-action" type="button" disabled>中键</button>
+          </div>
+
+          <div class="inline-form">
+            <label for="wheelDelta">滚轮</label>
+            <input id="wheelDelta" type="number" min="-127" max="127" value="-1" />
+            <button data-action="wheel" class="tool-btn hid-action" type="button" disabled>发送</button>
+          </div>
+        </section>
+
+        <section class="panel script-panel">
+          <div class="panel-head">
+            <h2>脚本</h2>
+            <button data-action="loadDemo" class="ghost-btn" type="button">Demo</button>
+          </div>
+
+          <textarea id="scriptText" class="script-editor" rows="11">type "abc 123"
+key tap ENTER
+mouse move 10 -5
+wait 100
+stop</textarea>
+          <div class="command-row">
+            <button data-action="parseScript" class="tool-btn" type="button">解析</button>
+            <button data-action="runScript" class="primary-btn hid-action" type="button" disabled>运行</button>
+          </div>
+          <div id="scriptSummary" class="status-box">脚本未解析</div>
+        </section>
+
+        <section class="panel log-panel">
+          <div class="panel-head">
+            <h2>日志</h2>
+            <button id="clearLogBtn" class="ghost-btn" type="button">清空</button>
+          </div>
+          <div id="logList" class="log-list" aria-live="polite"></div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
