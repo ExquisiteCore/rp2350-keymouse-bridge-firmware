@@ -54,6 +54,7 @@ Temporary Items
 # will have compiled files and executables
 debug/
 target/
+.worktrees/
 
 # Cargo.lock is intentionally kept for this firmware binary.
 
