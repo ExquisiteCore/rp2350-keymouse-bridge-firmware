@@ -217,10 +217,13 @@ impl Coordinator {
             RequestClass::BatchBegin => self.admit_batch_begin(request),
             RequestClass::BatchEnd => self.admit_batch_end(request),
             RequestClass::StopAll => {
-                if self.batch_state == BatchState::Collecting {
+                let admission = self.admit_bypass(request, true);
+                if self.batch_state == BatchState::Collecting
+                    && matches!(&admission, Admission::Execute(_))
+                {
                     self.batch_state = BatchState::Idle;
                 }
-                self.admit_bypass(request, true)
+                admission
             }
             RequestClass::Bypass => self.admit_bypass(request, false),
             RequestClass::Mutating => self.admit_mutating(request),
@@ -323,13 +326,12 @@ impl Coordinator {
             fingerprint,
             state: CacheState::Active,
         };
-        if !urgent
-            && self.cache.len() == RESPONSE_CACHE_SIZE - 1
-            && self
-                .cache
-                .iter()
-                .all(|entry| entry.state == CacheState::Active)
-        {
+        let active_entries = self
+            .cache
+            .iter()
+            .filter(|entry| entry.state == CacheState::Active)
+            .count();
+        if !urgent && active_entries >= RESPONSE_CACHE_SIZE - 1 {
             return false;
         }
         if self.cache.len() < RESPONSE_CACHE_SIZE {
@@ -1035,5 +1037,55 @@ mod tests {
             own_request_body(&request(2, 312, CommandType::BatchBegin, &[1])),
             Err(CommandError::InvalidPayloadLength)
         );
+    }
+
+    #[test]
+    fn mixed_cache_saturation_reserves_capacity_for_stop_all() {
+        let mut coordinator = Coordinator::new();
+        begin_batch(&mut coordinator, 1);
+
+        for sequence in 2..=63 {
+            let query = request(2, sequence, CommandType::Ping, &[]);
+            assert!(matches!(coordinator.admit(&query), Admission::Execute(_)));
+        }
+
+        let last_normal = request(2, 64, CommandType::Ping, &[]);
+        assert!(matches!(
+            coordinator.admit(&last_normal),
+            Admission::Execute(_)
+        ));
+
+        let overflow = request(2, 65, CommandType::Ping, &[]);
+        assert_eq!(
+            coordinator.admit(&overflow),
+            Admission::Busy(BusyReason::ExecutorOccupied)
+        );
+        assert!(!coordinator.has_cached_sequence(65));
+        assert_eq!(coordinator.batch_mode(), BatchMode::Collecting);
+
+        let stop = request(2, 66, CommandType::StopAll, &[]);
+        assert!(matches!(coordinator.admit(&stop), Admission::Execute(_)));
+        assert!(coordinator.has_cached_sequence(66));
+        assert!(coordinator.has_cached_sequence(2));
+        assert!(coordinator.has_cached_sequence(63));
+        assert!(coordinator.has_cached_sequence(64));
+        assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
+    }
+
+    #[test]
+    fn failed_urgent_stop_admission_preserves_collection_state() {
+        let mut coordinator = Coordinator::new();
+        coordinator.batch_state = BatchState::Collecting;
+        for sequence in 1..=RESPONSE_CACHE_SIZE as u16 {
+            assert!(coordinator.insert_active(sequence, u64::from(sequence), true));
+        }
+
+        let stop = request(2, 100, CommandType::StopAll, &[]);
+        assert_eq!(
+            coordinator.admit(&stop),
+            Admission::Busy(BusyReason::ExecutorOccupied)
+        );
+        assert!(!coordinator.has_cached_sequence(100));
+        assert_eq!(coordinator.batch_mode(), BatchMode::Collecting);
     }
 }
