@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::Timer;
+use embassy_usb::class::hid::ReadError;
 use embassy_usb::driver::EndpointError;
 use heapless::Vec;
 
@@ -34,7 +35,9 @@ use crate::static_resources::{
 };
 use crate::usb_device::{
     CdcControl, CdcReceiver, CdcSender, KeyboardReader, KeyboardWriter, MouseWriter,
+    set_caps_lock_enabled,
 };
+use crate::usb_identity::caps_lock_from_led_report;
 
 const BUSY_RETRY_MS: u16 = 10;
 
@@ -736,12 +739,15 @@ pub async fn lease_task() -> ! {
     }
 }
 
-/// Task 8 will wire the keyboard OUT endpoint and implement LED report parsing.
 #[embassy_executor::task]
-pub async fn keyboard_led_task(reader: KeyboardReader) -> ! {
-    let _reader = reader;
+pub async fn keyboard_led_task(mut reader: KeyboardReader) -> ! {
+    let mut report = [0u8; 1];
     loop {
-        Timer::after_millis(60_000).await;
+        match reader.read(&mut report).await {
+            Ok(1) => set_caps_lock_enabled(caps_lock_from_led_report(report[0])),
+            Ok(_) | Err(ReadError::BufferOverflow | ReadError::Sync(_)) => {}
+            Err(ReadError::Disabled) => reader.ready().await,
+        }
     }
 }
 

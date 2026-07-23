@@ -44,7 +44,7 @@ use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_time::Timer;
 use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::CdcAcmClass;
-use embassy_usb::class::hid::HidWriter;
+use embassy_usb::class::hid::{HidReaderWriter, HidWriter};
 use {defmt_rtt as _, panic_probe as _};
 
 use led::{
@@ -52,13 +52,16 @@ use led::{
     LedAnimator, LedMode, LedSignal,
 };
 use runtime::{
-    cdc_control_task, cdc_receive_task, dispatcher_task, executor_task, lease_task, response_task,
+    cdc_control_task, cdc_receive_task, dispatcher_task, executor_task, keyboard_led_task,
+    lease_task, response_task,
 };
 use static_resources::{
     static_buf_64, static_buf_256, static_buf_512, static_cdc_state, static_hid_state_keyboard,
-    static_hid_state_mouse, static_runtime_usb_handler,
+    static_hid_state_mouse, static_keyboard_led_handler, static_runtime_usb_handler,
+    static_usb_serial_buffer,
 };
 use usb_device::{keyboard_config, mouse_config, usb_config};
+use usb_identity::format_usb_serial;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -77,10 +80,13 @@ async fn main(spawner: embassy_executor::Spawner) {
         Err(_) => warn!("LED task spawn failed"),
     }
     let driver = Driver::new(p.USB, Irqs);
+    let chip_id = embassy_rp::otp::get_chipid().expect("read RP2350 chip ID");
+    let serial_number = format_usb_serial(chip_id, static_usb_serial_buffer())
+        .expect("format RP2350 USB serial number");
 
     let mut builder = Builder::new(
         driver,
-        usb_config(),
+        usb_config(serial_number),
         static_buf_512(),
         static_buf_256(),
         &mut [],
@@ -91,21 +97,29 @@ async fn main(spawner: embassy_executor::Spawner) {
 
     let cdc = CdcAcmClass::new(&mut builder, static_cdc_state(), 64);
 
-    let keyboard =
-        HidWriter::<_, 8>::new(&mut builder, static_hid_state_keyboard(), keyboard_config());
+    let keyboard = HidReaderWriter::<_, 1, 8>::new(
+        &mut builder,
+        static_hid_state_keyboard(),
+        keyboard_config(static_keyboard_led_handler()),
+    );
 
     let mouse = HidWriter::<_, 8>::new(&mut builder, static_hid_state_mouse(), mouse_config());
 
     let (sender, receiver, control) = cdc.split_with_control();
+    let (keyboard_reader, keyboard_writer) = keyboard.split();
     let mut usb = builder.build();
 
     match dispatcher_task() {
         Ok(task) => spawner.spawn(task),
         Err(_) => warn!("dispatcher task spawn failed"),
     }
-    match executor_task(keyboard, mouse) {
+    match executor_task(keyboard_writer, mouse) {
         Ok(task) => spawner.spawn(task),
         Err(_) => warn!("executor task spawn failed"),
+    }
+    match keyboard_led_task(keyboard_reader) {
+        Ok(task) => spawner.spawn(task),
+        Err(_) => warn!("keyboard LED task spawn failed"),
     }
     match response_task(sender) {
         Ok(task) => spawner.spawn(task),

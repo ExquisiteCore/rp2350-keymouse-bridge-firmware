@@ -7,12 +7,14 @@ use embassy_rp::usb::Driver;
 use embassy_usb::Config;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, ControlChanged, Receiver, Sender};
 use embassy_usb::class::hid::{
-    Config as HidConfig, HidBootProtocol, HidReader, HidSubclass, HidWriter, State as HidState,
+    Config as HidConfig, HidBootProtocol, HidReader, HidSubclass, HidWriter, ReportId,
+    RequestHandler, State as HidState,
 };
+use embassy_usb::control::OutResponse;
 use usbd_hid::descriptor::{KeyboardReport, MouseReport, SerializedDescriptor};
 
 use crate::firmware_config::{USB_PRODUCT_ID, USB_VENDOR_ID};
-use crate::usb_identity::{USB_MANUFACTURER, USB_PRODUCT, USB_SERIAL_NUMBER};
+use crate::usb_identity::{USB_MANUFACTURER, USB_PRODUCT, caps_lock_from_led_report};
 
 static CAPS_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -33,18 +35,29 @@ pub fn caps_lock_enabled() -> bool {
 
 /// Publishes the host Caps Lock LED state for ASCII mapping.
 ///
-/// Task 8's keyboard OUT report handler will call this setter. Release/Acquire
-/// ordering makes that handler's publication visible to command execution.
-#[allow(dead_code)]
+/// Release/Acquire ordering makes handler publication visible to command execution.
 pub fn set_caps_lock_enabled(enabled: bool) {
     CAPS_LOCK_ENABLED.store(enabled, Ordering::Release);
 }
 
-pub fn usb_config() -> Config<'static> {
+pub struct KeyboardLedHandler;
+
+impl RequestHandler for KeyboardLedHandler {
+    fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
+        if id != ReportId::Out(0) || data.len() != 1 {
+            return OutResponse::Rejected;
+        }
+
+        set_caps_lock_enabled(caps_lock_from_led_report(data[0]));
+        OutResponse::Accepted
+    }
+}
+
+pub fn usb_config(serial_number: &'static str) -> Config<'static> {
     let mut config = Config::new(USB_VENDOR_ID, USB_PRODUCT_ID);
     config.manufacturer = Some(USB_MANUFACTURER);
     config.product = Some(USB_PRODUCT);
-    config.serial_number = Some(USB_SERIAL_NUMBER);
+    config.serial_number = Some(serial_number);
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     config.composite_with_iads = true;
@@ -54,14 +67,14 @@ pub fn usb_config() -> Config<'static> {
     config
 }
 
-pub fn keyboard_config() -> HidConfig<'static> {
+pub fn keyboard_config(request_handler: &'static mut KeyboardLedHandler) -> HidConfig<'static> {
     HidConfig {
         report_descriptor: KeyboardReport::desc(),
-        request_handler: None,
+        request_handler: Some(request_handler),
         poll_ms: 1,
         max_packet_size: 64,
-        hid_subclass: HidSubclass::Boot,
-        hid_boot_protocol: HidBootProtocol::Keyboard,
+        hid_subclass: HidSubclass::No,
+        hid_boot_protocol: HidBootProtocol::None,
     }
 }
 
@@ -71,7 +84,7 @@ pub fn mouse_config() -> HidConfig<'static> {
         request_handler: None,
         poll_ms: 1,
         max_packet_size: 64,
-        hid_subclass: HidSubclass::Boot,
-        hid_boot_protocol: HidBootProtocol::Mouse,
+        hid_subclass: HidSubclass::No,
+        hid_boot_protocol: HidBootProtocol::None,
     }
 }

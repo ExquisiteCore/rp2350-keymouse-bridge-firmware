@@ -9,7 +9,8 @@ use static_cell::StaticCell;
 
 use crate::coordinator::{CachedResponse, OwnedRequest, SafetyEvent};
 use crate::runtime::{ExecutionJob, ExecutionResult};
-use crate::usb_device::UsbHidState;
+use crate::usb_device::{KeyboardLedHandler, UsbHidState};
+use crate::usb_identity::USB_SERIAL_CAPACITY;
 
 pub static REQUESTS: Channel<CriticalSectionRawMutex, OwnedRequest, 8> = Channel::new();
 pub static JOBS: Channel<CriticalSectionRawMutex, ExecutionJob, 1> = Channel::new();
@@ -35,6 +36,16 @@ impl Handler for RuntimeUsbHandler {
 pub fn static_runtime_usb_handler() -> &'static mut RuntimeUsbHandler {
     static CELL: StaticCell<RuntimeUsbHandler> = StaticCell::new();
     CELL.init(RuntimeUsbHandler)
+}
+
+pub fn static_keyboard_led_handler() -> &'static mut KeyboardLedHandler {
+    static CELL: StaticCell<KeyboardLedHandler> = StaticCell::new();
+    CELL.init(KeyboardLedHandler)
+}
+
+pub fn static_usb_serial_buffer() -> &'static mut [u8; USB_SERIAL_CAPACITY] {
+    static CELL: StaticCell<[u8; USB_SERIAL_CAPACITY]> = StaticCell::new();
+    CELL.init([0; USB_SERIAL_CAPACITY])
 }
 
 pub fn static_buf_512() -> &'static mut [u8; 512] {

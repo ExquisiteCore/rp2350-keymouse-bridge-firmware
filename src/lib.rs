@@ -20,14 +20,27 @@ pub use protocol::{
 
 #[cfg(test)]
 mod usb_identity_tests {
+    use crate::usb_identity::{
+        USB_PRODUCT, USB_SERIAL_CAPACITY, caps_lock_from_led_report, format_usb_serial,
+    };
+
     #[test]
     fn usb_identity_uses_exquisitecore_name() {
         assert_eq!(crate::usb_identity::USB_MANUFACTURER, "ExquisiteCore");
-        assert_eq!(
-            crate::usb_identity::USB_PRODUCT,
-            "ExquisiteCore KeyMouse Bridge"
-        );
-        assert_eq!(crate::usb_identity::USB_SERIAL_NUMBER, "EXQC-KMOUSE-0001");
+        assert_eq!(USB_PRODUCT, "ExquisiteCore KeyMouse Bridge");
+    }
+
+    #[test]
+    fn formats_chip_id_as_stable_usb_serial() {
+        let mut out = [0u8; USB_SERIAL_CAPACITY];
+        let serial = format_usb_serial(0x0123_4567_89AB_CDEF, &mut out).unwrap();
+        assert_eq!(serial, "EXQC-KMOUSE-0123456789ABCDEF");
+    }
+
+    #[test]
+    fn caps_lock_output_bit_is_detected() {
+        assert!(!caps_lock_from_led_report(0b0000_0001));
+        assert!(caps_lock_from_led_report(0b0000_0010));
     }
 }
 

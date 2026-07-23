@@ -7,8 +7,7 @@ pub use crate::protocol::PROTOCOL_VERSION;
 #[allow(unused_imports)]
 pub use crate::safety::{CONTROL_LEASE_MS, HEARTBEAT_INTERVAL_MS, PARTIAL_FRAME_TIMEOUT_MS};
 
-pub const USB_VENDOR_ID: u16 = 0xCAFE;
-pub const USB_PRODUCT_ID: u16 = 0x2350;
+include!(concat!(env!("OUT_DIR"), "/usb_ids.rs"));
 
 pub const KEY_TAP_DELAY_MS: u64 = 8;
 pub const MOUSE_CLICK_DELAY_MS: u64 = 20;
