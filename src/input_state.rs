@@ -2,7 +2,8 @@ use crate::commands::{KeyStroke, MouseButton, ascii_to_keystroke_with_caps_lock}
 use heapless::Vec;
 
 const MAX_HELD_KEYS: usize = 6;
-const MAX_ASCII_STROKES: usize = 240;
+/// Maximum number of keystrokes produced from one protocol payload.
+pub const MAX_ASCII_STROKES: usize = crate::protocol::MAX_PAYLOAD_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputError {
@@ -601,6 +602,8 @@ mod tests {
 
     #[test]
     fn ascii_capacity_boundary_is_transactional() {
+        assert_eq!(MAX_ASCII_STROKES, crate::protocol::MAX_PAYLOAD_SIZE);
+
         let mut out = Vec::<KeyStroke, 240>::new();
         ascii_strokes(&[b'a'; 240], false, &mut out).unwrap();
         assert_eq!(out.len(), 240);
