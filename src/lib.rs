@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod commands;
+pub mod coordinator;
 pub mod error;
 pub mod firmware_config;
 pub mod frame_stream;

@@ -1,6 +1,7 @@
 //! 固件响应给主机的错误码。
 
-use crate::protocol::DecodeError;
+use crate::commands::CommandError;
+use crate::protocol::{DecodeError, RequestError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -33,11 +34,42 @@ impl ErrorCode {
             | DecodeError::BadCrc => Self::BadFrame,
         }
     }
+
+    pub const fn from_request(error: RequestError) -> Self {
+        match error {
+            RequestError::UnsupportedVersion => Self::UnsupportedVersion,
+            RequestError::UnsupportedFlags => Self::UnsupportedFlags,
+            RequestError::InvalidSequence => Self::InvalidSequence,
+        }
+    }
+
+    pub const fn from_command(error: CommandError) -> Self {
+        match error {
+            CommandError::WaitTooLong => Self::WaitTooLong,
+            CommandError::InvalidPayloadLength
+            | CommandError::InvalidMouseButton
+            | CommandError::UnsupportedCommand => Self::BadCommand,
+        }
+    }
+}
+
+impl From<RequestError> for ErrorCode {
+    fn from(error: RequestError) -> Self {
+        Self::from_request(error)
+    }
+}
+
+impl From<CommandError> for ErrorCode {
+    fn from(error: CommandError) -> Self {
+        Self::from_command(error)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::CommandError;
+    use crate::protocol::RequestError;
 
     #[test]
     fn all_decode_errors_map_to_bad_frame() {
@@ -72,5 +104,33 @@ mod tests {
         assert_eq!(ErrorCode::WaitTooLong as u8, 14);
         assert_eq!(ErrorCode::KeyboardBusy as u8, 15);
         assert_eq!(ErrorCode::Cancelled as u8, 16);
+    }
+
+    #[test]
+    fn request_and_command_errors_map_precisely() {
+        assert_eq!(
+            ErrorCode::from(RequestError::UnsupportedVersion),
+            ErrorCode::UnsupportedVersion
+        );
+        assert_eq!(
+            ErrorCode::from(RequestError::UnsupportedFlags),
+            ErrorCode::UnsupportedFlags
+        );
+        assert_eq!(
+            ErrorCode::from(RequestError::InvalidSequence),
+            ErrorCode::InvalidSequence
+        );
+
+        assert_eq!(
+            ErrorCode::from(CommandError::WaitTooLong),
+            ErrorCode::WaitTooLong
+        );
+        for error in [
+            CommandError::InvalidPayloadLength,
+            CommandError::InvalidMouseButton,
+            CommandError::UnsupportedCommand,
+        ] {
+            assert_eq!(ErrorCode::from(error), ErrorCode::BadCommand);
+        }
     }
 }
