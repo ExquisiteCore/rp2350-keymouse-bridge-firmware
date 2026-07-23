@@ -61,6 +61,53 @@ impl CachedResponse {
     }
 }
 
+/// Opaque identity for completing one exact accepted request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletionToken {
+    session_generation: u64,
+    admission_id: u64,
+    version: u8,
+    sequence: u16,
+    fingerprint: u64,
+}
+
+impl CompletionToken {
+    /// Returns the session generation in which this request was admitted.
+    pub const fn session_generation(self) -> u64 {
+        self.session_generation
+    }
+
+    /// Returns the unique admission identifier within the coordinator lifetime.
+    pub const fn admission_id(self) -> u64 {
+        self.admission_id
+    }
+
+    /// Returns the accepted protocol version.
+    pub const fn version(self) -> u8 {
+        self.version
+    }
+
+    /// Returns the accepted request sequence.
+    pub const fn sequence(self) -> u16 {
+        self.sequence
+    }
+
+    /// Returns the fingerprint of the accepted request fields and payload.
+    pub const fn fingerprint(self) -> u64 {
+        self.fingerprint
+    }
+
+    /// Builds a final ACK bound to this request's version and sequence.
+    pub fn ack(self) -> CachedResponse {
+        CachedResponse::ack(self.version, self.sequence)
+    }
+
+    /// Builds a final NACK bound to this request's version and sequence.
+    pub fn nack(self, error: ErrorCode) -> CachedResponse {
+        CachedResponse::nack(self.version, self.sequence, error)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 // Commands stay inline so requests remain allocation-free under `no_std`.
 #[allow(clippy::large_enum_variant)]
@@ -70,31 +117,100 @@ pub enum OwnedRequestBody {
     BatchEnd,
 }
 
+/// Allocation-free request owned by the future dispatcher channel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedRequest {
-    pub version: u8,
-    pub flags: u8,
-    pub sequence: u16,
-    pub command_type: CommandType,
-    pub fingerprint: u64,
-    pub request_kind: RequestKind,
-    pub body: OwnedRequestBody,
+    version: u8,
+    flags: u8,
+    sequence: u16,
+    command_type: CommandType,
+    fingerprint: u64,
+    request_kind: RequestKind,
+    completion_token: Option<CompletionToken>,
+    body: OwnedRequestBody,
 }
 
+impl OwnedRequest {
+    /// Returns the accepted protocol version.
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Returns the accepted request flags.
+    pub const fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Returns the accepted request sequence.
+    pub const fn sequence(&self) -> u16 {
+        self.sequence
+    }
+
+    /// Returns the accepted command type.
+    pub const fn command_type(&self) -> CommandType {
+        self.command_type
+    }
+
+    /// Returns the deterministic request fingerprint.
+    pub const fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+
+    /// Returns whether this request expects a response.
+    pub const fn request_kind(&self) -> RequestKind {
+        self.request_kind
+    }
+
+    /// Returns the exact completion identity, or `None` for no-response heartbeat.
+    pub const fn completion_token(&self) -> Option<CompletionToken> {
+        self.completion_token
+    }
+
+    /// Borrows the owned command or batch marker.
+    pub const fn body(&self) -> &OwnedRequestBody {
+        &self.body
+    }
+
+    /// Consumes the request and returns its owned command or batch marker.
+    pub fn into_body(self) -> OwnedRequestBody {
+        self.body
+    }
+}
+
+/// Coordinator decision that makes dispatcher scheduling semantics explicit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Admission {
+    /// Run an exclusive ordinary mutation or execute a completed batch.
     Execute(OwnedRequest),
+    /// Append a batchable command to the dispatcher's current collector.
     Collect(OwnedRequest),
+    /// Handle a response-bearing query or diagnostic without exclusive ownership.
+    Bypass(OwnedRequest),
+    /// Handle a sequence-zero heartbeat without caching or responding.
+    NoResponse(OwnedRequest),
+    /// Urgently cancel and release input state; response completion remains token-bound.
+    Stop(OwnedRequest),
+    /// Replay an exact final response from the current-session cache.
     Replay(CachedResponse),
+    /// Retryable interim refusal that is never cached as final.
     Busy(BusyReason),
+    /// Response produced and completed synchronously by the coordinator.
     Immediate(CachedResponse),
+    /// Permanent validation or lifecycle rejection.
     Reject(ErrorCode),
 }
 
+/// Failure to complete an accepted request safely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionError {
-    MissingActive,
+    /// The token no longer identifies an active cache entry.
+    StaleCompletion,
+    /// The response sequence does not match the accepted request.
     ResponseSequenceMismatch,
+    /// The response version does not match the accepted request.
+    ResponseVersionMismatch,
+    /// The response is interim, malformed, or not a supported final response type.
+    NonFinalResponse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,7 +224,7 @@ pub enum BatchMode {
 enum BatchState {
     Idle,
     Collecting,
-    Executing { owner: u16 },
+    Executing { owner: CompletionToken },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,13 +246,16 @@ enum CacheState {
 struct CacheEntry {
     sequence: u16,
     fingerprint: u64,
+    token: CompletionToken,
     state: CacheState,
 }
 
 pub struct Coordinator {
     cache: Vec<CacheEntry, RESPONSE_CACHE_SIZE>,
     next_evict: usize,
-    executor_owner: Option<u16>,
+    session_generation: u64,
+    next_admission_id: u64,
+    executor_owner: Option<CompletionToken>,
     batch_state: BatchState,
 }
 
@@ -145,6 +264,8 @@ impl Coordinator {
         Self {
             cache: Vec::new(),
             next_evict: 0,
+            session_generation: 0,
+            next_admission_id: 1,
             executor_owner: None,
             batch_state: BatchState::Idle,
         }
@@ -154,8 +275,9 @@ impl Coordinator {
         self.cache.iter().any(|entry| entry.sequence == sequence)
     }
 
+    /// Reports whether an ordinary mutation or batch execution owns exclusive dispatch.
     pub const fn is_executor_occupied(&self) -> bool {
-        self.executor_owner.is_some()
+        self.executor_owner.is_some() || matches!(self.batch_state, BatchState::Executing { .. })
     }
 
     pub const fn batch_mode(&self) -> BatchMode {
@@ -166,11 +288,12 @@ impl Coordinator {
         }
     }
 
-    pub fn cancel_batch(&mut self) {
-        self.batch_state = BatchState::Idle;
-    }
-
+    /// Starts a fresh session and invalidates all outstanding completion tokens.
     pub fn clear_session(&mut self) {
+        self.session_generation = self
+            .session_generation
+            .checked_add(1)
+            .expect("session generation exhausted");
         self.cache.clear();
         self.next_evict = 0;
         self.executor_owner = None;
@@ -210,99 +333,113 @@ impl Coordinator {
             command_type: frame.command_type,
             fingerprint,
             request_kind,
+            completion_token: None,
             body,
         };
 
         match request_class {
             RequestClass::BatchBegin => self.admit_batch_begin(request),
             RequestClass::BatchEnd => self.admit_batch_end(request),
-            RequestClass::StopAll => {
-                let admission = self.admit_bypass(request, true);
-                if self.batch_state == BatchState::Collecting
-                    && matches!(&admission, Admission::Execute(_))
-                {
-                    self.batch_state = BatchState::Idle;
-                }
-                admission
-            }
-            RequestClass::Bypass => self.admit_bypass(request, false),
+            RequestClass::StopAll => self.admit_stop(request),
+            RequestClass::Bypass => self.admit_bypass(request),
             RequestClass::Mutating => self.admit_mutating(request),
         }
     }
 
+    /// Stores a validated final response for the exact active admission token.
     pub fn complete(
         &mut self,
-        sequence: u16,
+        token: CompletionToken,
         response: CachedResponse,
     ) -> Result<(), CompletionError> {
-        if response.sequence != sequence {
+        if response.sequence != token.sequence {
             return Err(CompletionError::ResponseSequenceMismatch);
+        }
+        if response.version != token.version {
+            return Err(CompletionError::ResponseVersionMismatch);
+        }
+        if !is_final_response(&response) {
+            return Err(CompletionError::NonFinalResponse);
         }
         let entry = self
             .cache
             .iter_mut()
-            .find(|entry| entry.sequence == sequence && entry.state == CacheState::Active)
-            .ok_or(CompletionError::MissingActive)?;
+            .find(|entry| entry.token == token && entry.state == CacheState::Active)
+            .ok_or(CompletionError::StaleCompletion)?;
         entry.state = CacheState::Completed(response);
-        if self.executor_owner == Some(sequence) {
+        if self.executor_owner == Some(token) {
             self.executor_owner = None;
         }
         if matches!(
             self.batch_state,
-            BatchState::Executing { owner } if owner == sequence
+            BatchState::Executing { owner } if owner == token
         ) {
             self.batch_state = BatchState::Idle;
         }
         Ok(())
     }
 
-    fn admit_batch_begin(&mut self, request: OwnedRequest) -> Admission {
+    fn admit_batch_begin(&mut self, mut request: OwnedRequest) -> Admission {
         if self.batch_state != BatchState::Idle {
             return Admission::Reject(ErrorCode::BatchState);
         }
         if self.executor_owner.is_some() {
             return Admission::Busy(BusyReason::ExecutorOccupied);
         }
-        if !self.insert_active(request.sequence, request.fingerprint, false) {
+        if !self.insert_active(&mut request, false) {
             return Admission::Busy(BusyReason::ExecutorOccupied);
         }
 
         self.batch_state = BatchState::Collecting;
-        let response = CachedResponse::ack(request.version, request.sequence);
-        let completed = self.complete(request.sequence, response.clone());
+        let token = request
+            .completion_token
+            .expect("response-bearing begin has a completion token");
+        let response = token.ack();
+        let completed = self.complete(token, response.clone());
         debug_assert_eq!(completed, Ok(()));
         Admission::Immediate(response)
     }
 
-    fn admit_batch_end(&mut self, request: OwnedRequest) -> Admission {
+    fn admit_batch_end(&mut self, mut request: OwnedRequest) -> Admission {
         if self.batch_state != BatchState::Collecting {
             return Admission::Reject(ErrorCode::BatchState);
         }
-        if !self.insert_active(request.sequence, request.fingerprint, false) {
+        if !self.insert_active(&mut request, false) {
             return Admission::Busy(BusyReason::ExecutorOccupied);
         }
 
-        self.batch_state = BatchState::Executing {
-            owner: request.sequence,
-        };
+        let owner = request
+            .completion_token
+            .expect("response-bearing batch end has a completion token");
+        self.batch_state = BatchState::Executing { owner };
         Admission::Execute(request)
     }
 
-    fn admit_bypass(&mut self, request: OwnedRequest, urgent: bool) -> Admission {
+    fn admit_bypass(&mut self, mut request: OwnedRequest) -> Admission {
         if request.request_kind == RequestKind::NoResponseHeartbeat {
-            return Admission::Execute(request);
+            return Admission::NoResponse(request);
         }
-        if !self.insert_active(request.sequence, request.fingerprint, urgent) {
+        if !self.insert_active(&mut request, false) {
             return Admission::Busy(BusyReason::ExecutorOccupied);
         }
-        Admission::Execute(request)
+        Admission::Bypass(request)
     }
 
-    fn admit_mutating(&mut self, request: OwnedRequest) -> Admission {
+    fn admit_stop(&mut self, mut request: OwnedRequest) -> Admission {
+        if !self.insert_active(&mut request, true) {
+            return Admission::Busy(BusyReason::ExecutorOccupied);
+        }
+        if self.batch_state == BatchState::Collecting {
+            self.batch_state = BatchState::Idle;
+        }
+        Admission::Stop(request)
+    }
+
+    fn admit_mutating(&mut self, mut request: OwnedRequest) -> Admission {
         match self.batch_state {
             BatchState::Executing { .. } => Admission::Busy(BusyReason::BatchExecuting),
             BatchState::Collecting => {
-                if !self.insert_active(request.sequence, request.fingerprint, false) {
+                if !self.insert_active(&mut request, false) {
                     return Admission::Busy(BusyReason::ExecutorOccupied);
                 }
                 Admission::Collect(request)
@@ -311,21 +448,16 @@ impl Coordinator {
                 Admission::Busy(BusyReason::ExecutorOccupied)
             }
             BatchState::Idle => {
-                if !self.insert_active(request.sequence, request.fingerprint, false) {
+                if !self.insert_active(&mut request, false) {
                     return Admission::Busy(BusyReason::ExecutorOccupied);
                 }
-                self.executor_owner = Some(request.sequence);
+                self.executor_owner = request.completion_token;
                 Admission::Execute(request)
             }
         }
     }
 
-    fn insert_active(&mut self, sequence: u16, fingerprint: u64, urgent: bool) -> bool {
-        let entry = CacheEntry {
-            sequence,
-            fingerprint,
-            state: CacheState::Active,
-        };
+    fn insert_active(&mut self, request: &mut OwnedRequest, urgent: bool) -> bool {
         let active_entries = self
             .cache
             .iter()
@@ -334,20 +466,63 @@ impl Coordinator {
         if !urgent && active_entries >= RESPONSE_CACHE_SIZE - 1 {
             return false;
         }
-        if self.cache.len() < RESPONSE_CACHE_SIZE {
-            return self.cache.push(entry).is_ok();
-        }
 
-        for offset in 0..RESPONSE_CACHE_SIZE {
-            let index = (self.next_evict + offset) % RESPONSE_CACHE_SIZE;
-            if matches!(self.cache[index].state, CacheState::Completed(_)) {
-                self.cache[index] = entry;
-                self.next_evict = (index + 1) % RESPONSE_CACHE_SIZE;
-                return true;
+        let replacement_index = if self.cache.len() < RESPONSE_CACHE_SIZE {
+            None
+        } else {
+            let mut completed_index = None;
+            for offset in 0..RESPONSE_CACHE_SIZE {
+                let index = (self.next_evict + offset) % RESPONSE_CACHE_SIZE;
+                if matches!(self.cache[index].state, CacheState::Completed(_)) {
+                    completed_index = Some(index);
+                    break;
+                }
             }
-        }
+            let Some(index) = completed_index else {
+                return false;
+            };
+            Some(index)
+        };
 
-        false
+        let Some(token) = self.next_completion_token(request) else {
+            return false;
+        };
+        let entry = CacheEntry {
+            sequence: request.sequence,
+            fingerprint: request.fingerprint,
+            token,
+            state: CacheState::Active,
+        };
+
+        if let Some(index) = replacement_index {
+            self.cache[index] = entry;
+            self.next_evict = (index + 1) % RESPONSE_CACHE_SIZE;
+        } else if self.cache.push(entry).is_err() {
+            return false;
+        }
+        request.completion_token = Some(token);
+        true
+    }
+
+    fn next_completion_token(&mut self, request: &OwnedRequest) -> Option<CompletionToken> {
+        let admission_id = self.next_admission_id;
+        self.next_admission_id = admission_id.checked_add(1)?;
+        Some(CompletionToken {
+            session_generation: self.session_generation,
+            admission_id,
+            version: request.version,
+            sequence: request.sequence,
+            fingerprint: request.fingerprint,
+        })
+    }
+}
+
+fn is_final_response(response: &CachedResponse) -> bool {
+    match response.command_type {
+        CommandType::Ack => response.payload.is_empty(),
+        CommandType::Nack => response.payload.len() == 1,
+        CommandType::Status => true,
+        _ => false,
     }
 }
 
@@ -436,18 +611,57 @@ mod tests {
         }
     }
 
+    fn response_for(
+        token: CompletionToken,
+        command_type: CommandType,
+        payload: &[u8],
+    ) -> CachedResponse {
+        let mut owned_payload = Vec::<u8, 16>::new();
+        owned_payload.extend_from_slice(payload).unwrap();
+        CachedResponse {
+            version: token.version(),
+            sequence: token.sequence(),
+            command_type,
+            payload: owned_payload,
+        }
+    }
+
+    fn response_token(admission: Admission) -> CompletionToken {
+        let request = match admission {
+            Admission::Execute(request)
+            | Admission::Collect(request)
+            | Admission::Bypass(request)
+            | Admission::Stop(request) => request,
+            other => panic!("expected response-bearing admission, got {other:?}"),
+        };
+        request
+            .completion_token()
+            .expect("response-bearing admission must carry a token")
+    }
+
+    fn unadmitted_request(frame: &Frame<'_>) -> OwnedRequest {
+        OwnedRequest {
+            version: frame.version,
+            flags: frame.flags,
+            sequence: frame.sequence,
+            command_type: frame.command_type,
+            fingerprint: fingerprint(frame),
+            request_kind: validate_request(frame).unwrap(),
+            completion_token: None,
+            body: own_request_body(frame).unwrap(),
+        }
+    }
+
     #[test]
     fn active_duplicate_is_busy_then_completed_duplicate_replays() {
         let request = request(2, 41, CommandType::MouseClick, &[1]);
         let mut coordinator = Coordinator::new();
-        assert!(matches!(coordinator.admit(&request), Admission::Execute(_)));
+        let token = response_token(coordinator.admit(&request));
         assert!(matches!(
             coordinator.admit(&request),
             Admission::Busy(BusyReason::ActiveDuplicate)
         ));
-        coordinator
-            .complete(41, CachedResponse::ack(2, 41))
-            .unwrap();
+        coordinator.complete(token, token.ack()).unwrap();
         assert_eq!(
             coordinator.admit(&request),
             Admission::Replay(CachedResponse::ack(2, 41))
@@ -553,43 +767,39 @@ mod tests {
             panic!("ordinary command should execute");
         };
 
-        assert_eq!(owned.version, 2);
-        assert_eq!(owned.flags, 0);
-        assert_eq!(owned.sequence, 17);
-        assert_eq!(owned.command_type, CommandType::TypeAscii);
-        assert_eq!(owned.fingerprint, expected_fingerprint);
-        assert_eq!(owned.request_kind, RequestKind::ResponseExpected);
+        assert_eq!(owned.version(), 2);
+        assert_eq!(owned.flags(), 0);
+        assert_eq!(owned.sequence(), 17);
+        assert_eq!(owned.command_type(), CommandType::TypeAscii);
+        assert_eq!(owned.fingerprint(), expected_fingerprint);
+        assert_eq!(owned.request_kind(), RequestKind::ResponseExpected);
+        assert!(owned.completion_token().is_some());
         assert_eq!(
-            owned.body,
-            OwnedRequestBody::Command(OwnedCommand::type_ascii(b"abc").unwrap())
+            owned.body(),
+            &OwnedRequestBody::Command(OwnedCommand::type_ascii(b"abc").unwrap())
         );
     }
 
     #[test]
-    fn completion_rejects_response_mismatch_and_missing_active_sequence() {
+    fn completion_rejects_response_mismatch_and_stale_token() {
         let mut coordinator = Coordinator::new();
         let frame = request(2, 21, CommandType::MouseClick, &[1]);
-        assert!(matches!(coordinator.admit(&frame), Admission::Execute(_)));
+        let token = response_token(coordinator.admit(&frame));
 
         assert_eq!(
-            coordinator.complete(21, CachedResponse::ack(2, 22)),
+            coordinator.complete(token, CachedResponse::ack(2, 22)),
             Err(CompletionError::ResponseSequenceMismatch)
         );
         assert_eq!(
             coordinator.admit(&frame),
             Admission::Busy(BusyReason::ActiveDuplicate)
         );
-        assert_eq!(
-            coordinator.complete(99, CachedResponse::ack(2, 99)),
-            Err(CompletionError::MissingActive)
-        );
-
         coordinator
-            .complete(21, CachedResponse::nack(2, 21, ErrorCode::Cancelled))
+            .complete(token, token.nack(ErrorCode::Cancelled))
             .unwrap();
         assert_eq!(
-            coordinator.complete(21, CachedResponse::ack(2, 21)),
-            Err(CompletionError::MissingActive)
+            coordinator.complete(token, token.ack()),
+            Err(CompletionError::StaleCompletion)
         );
         assert_eq!(
             coordinator.admit(&frame),
@@ -604,15 +814,13 @@ mod tests {
 
         for sequence in 1..=RESPONSE_CACHE_SIZE as u16 {
             let frame = request(2, sequence, CommandType::Ping, &[]);
-            assert!(matches!(coordinator.admit(&frame), Admission::Execute(_)));
-            coordinator
-                .complete(sequence, CachedResponse::ack(2, sequence))
-                .unwrap();
+            let token = response_token(coordinator.admit(&frame));
+            coordinator.complete(token, token.ack()).unwrap();
         }
         assert!(coordinator.has_cached_sequence(1));
 
         let newest = request(2, 65, CommandType::Ping, &[]);
-        assert!(matches!(coordinator.admit(&newest), Admission::Execute(_)));
+        assert!(matches!(coordinator.admit(&newest), Admission::Bypass(_)));
         assert!(!coordinator.has_cached_sequence(1));
         assert!(coordinator.has_cached_sequence(65));
 
@@ -624,25 +832,23 @@ mod tests {
         assert!(!coordinator.has_cached_sequence(1));
         assert!(!coordinator.has_cached_sequence(65));
         assert!(!coordinator.is_executor_occupied());
-        assert!(matches!(coordinator.admit(&newest), Admission::Execute(_)));
+        assert!(matches!(coordinator.admit(&newest), Admission::Bypass(_)));
     }
 
     #[test]
     fn cache_churn_never_evicts_active_entry_when_completed_entry_exists() {
         let mut coordinator = Coordinator::new();
         let active = request(2, 1, CommandType::Ping, &[]);
-        assert!(matches!(coordinator.admit(&active), Admission::Execute(_)));
+        assert!(matches!(coordinator.admit(&active), Admission::Bypass(_)));
 
         for sequence in 2..=RESPONSE_CACHE_SIZE as u16 {
             let frame = request(2, sequence, CommandType::GetInfo, &[]);
-            assert!(matches!(coordinator.admit(&frame), Admission::Execute(_)));
-            coordinator
-                .complete(sequence, CachedResponse::ack(2, sequence))
-                .unwrap();
+            let token = response_token(coordinator.admit(&frame));
+            coordinator.complete(token, token.ack()).unwrap();
         }
 
         let churn = request(2, 65, CommandType::GetCaps, &[]);
-        assert!(matches!(coordinator.admit(&churn), Admission::Execute(_)));
+        assert!(matches!(coordinator.admit(&churn), Admission::Bypass(_)));
         assert!(coordinator.has_cached_sequence(1));
         assert_eq!(
             coordinator.admit(&active),
@@ -656,7 +862,7 @@ mod tests {
         let owner = request(2, 31, CommandType::MouseMoveRel, &[0, 1, 0, 1]);
         let waiting = request(2, 32, CommandType::MouseClick, &[1]);
 
-        assert!(matches!(coordinator.admit(&owner), Admission::Execute(_)));
+        let owner_token = response_token(coordinator.admit(&owner));
         assert!(coordinator.is_executor_occupied());
         assert_eq!(
             coordinator.admit(&waiting),
@@ -665,7 +871,7 @@ mod tests {
         assert!(!coordinator.has_cached_sequence(32));
 
         coordinator
-            .complete(31, CachedResponse::ack(2, 31))
+            .complete(owner_token, owner_token.ack())
             .unwrap();
         assert!(!coordinator.is_executor_occupied());
         assert!(matches!(coordinator.admit(&waiting), Admission::Execute(_)));
@@ -676,7 +882,7 @@ mod tests {
     fn occupied_executor_allows_every_bypass_without_releasing_owner() {
         let mut coordinator = Coordinator::new();
         let owner = request(2, 40, CommandType::WaitMs, &[0, 0, 0, 1]);
-        assert!(matches!(coordinator.admit(&owner), Admission::Execute(_)));
+        let owner_token = response_token(coordinator.admit(&owner));
 
         for (sequence, command_type) in [
             (41, CommandType::Ping),
@@ -686,10 +892,8 @@ mod tests {
             (45, CommandType::StopAll),
         ] {
             let bypass = request(2, sequence, command_type, &[]);
-            assert!(matches!(coordinator.admit(&bypass), Admission::Execute(_)));
-            coordinator
-                .complete(sequence, CachedResponse::ack(2, sequence))
-                .unwrap();
+            let token = response_token(coordinator.admit(&bypass));
+            coordinator.complete(token, token.ack()).unwrap();
             assert!(coordinator.is_executor_occupied());
 
             let ordinary = request(2, sequence + 100, CommandType::MouseClick, &[1]);
@@ -701,7 +905,7 @@ mod tests {
         }
 
         coordinator
-            .complete(40, CachedResponse::ack(2, 40))
+            .complete(owner_token, owner_token.ack())
             .unwrap();
         assert!(!coordinator.is_executor_occupied());
     }
@@ -712,23 +916,19 @@ mod tests {
         let no_response = request_with_flags(2, FLAG_NO_RESPONSE, 0, CommandType::Heartbeat, &[]);
 
         for _ in 0..2 {
-            let Admission::Execute(owned) = coordinator.admit(&no_response) else {
+            let Admission::NoResponse(owned) = coordinator.admit(&no_response) else {
                 panic!("no-response heartbeat should dispatch without a response entry");
             };
-            assert_eq!(owned.request_kind, RequestKind::NoResponseHeartbeat);
-            assert_eq!(owned.sequence, 0);
+            assert_eq!(owned.request_kind(), RequestKind::NoResponseHeartbeat);
+            assert_eq!(owned.sequence(), 0);
+            assert_eq!(owned.completion_token(), None);
             assert!(!coordinator.has_cached_sequence(0));
         }
 
         let diagnostic = request(2, 46, CommandType::Heartbeat, &[]);
-        assert!(matches!(
-            coordinator.admit(&diagnostic),
-            Admission::Execute(_)
-        ));
+        let token = response_token(coordinator.admit(&diagnostic));
         assert!(coordinator.has_cached_sequence(46));
-        coordinator
-            .complete(46, CachedResponse::ack(2, 46))
-            .unwrap();
+        coordinator.complete(token, token.ack()).unwrap();
         assert_eq!(
             coordinator.admit(&diagnostic),
             Admission::Replay(CachedResponse::ack(2, 46))
@@ -820,9 +1020,10 @@ mod tests {
             let Admission::Collect(owned) = coordinator.admit(&frame) else {
                 panic!("batchable command should be returned to the dispatcher collector");
             };
-            assert_eq!(owned.sequence, *sequence);
-            assert_eq!(owned.command_type, *command_type);
-            assert!(matches!(owned.body, OwnedRequestBody::Command(_)));
+            let token = owned.completion_token().unwrap();
+            assert_eq!(owned.sequence(), *sequence);
+            assert_eq!(owned.command_type(), *command_type);
+            assert!(matches!(owned.body(), OwnedRequestBody::Command(_)));
 
             if index == 0 {
                 assert_eq!(
@@ -830,9 +1031,7 @@ mod tests {
                     Admission::Busy(BusyReason::ActiveDuplicate)
                 );
             }
-            coordinator
-                .complete(*sequence, CachedResponse::ack(2, *sequence))
-                .unwrap();
+            coordinator.complete(token, token.ack()).unwrap();
             assert_eq!(
                 coordinator.admit(&frame),
                 Admission::Replay(CachedResponse::ack(2, *sequence))
@@ -849,7 +1048,8 @@ mod tests {
         let Admission::Execute(owned_end) = coordinator.admit(&end) else {
             panic!("batch end should transfer the collected batch to execution");
         };
-        assert_eq!(owned_end.body, OwnedRequestBody::BatchEnd);
+        let end_token = owned_end.completion_token().unwrap();
+        assert_eq!(owned_end.body(), &OwnedRequestBody::BatchEnd);
         assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
 
         let ordinary = request(2, 102, CommandType::MouseClick, &[1]);
@@ -860,20 +1060,18 @@ mod tests {
         assert!(!coordinator.has_cached_sequence(102));
 
         let query = request(2, 103, CommandType::GetInfo, &[]);
-        assert!(matches!(coordinator.admit(&query), Admission::Execute(_)));
+        let query_token = response_token(coordinator.admit(&query));
         coordinator
-            .complete(103, CachedResponse::ack(2, 103))
+            .complete(query_token, query_token.ack())
             .unwrap();
         assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
         assert_eq!(
-            coordinator.complete(101, CachedResponse::ack(2, 999)),
+            coordinator.complete(end_token, CachedResponse::ack(2, 999)),
             Err(CompletionError::ResponseSequenceMismatch)
         );
         assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
 
-        coordinator
-            .complete(101, CachedResponse::ack(2, 101))
-            .unwrap();
+        coordinator.complete(end_token, end_token.ack()).unwrap();
         assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
         assert_eq!(
             coordinator.admit(&end),
@@ -882,11 +1080,11 @@ mod tests {
     }
 
     #[test]
-    fn batch_execution_allows_every_bypass_and_explicit_cancellation_clears_mode() {
+    fn batch_execution_allows_every_bypass_and_owner_completion_clears_mode() {
         let mut coordinator = Coordinator::new();
         begin_batch(&mut coordinator, 110);
         let end = request(2, 111, CommandType::BatchEnd, &[]);
-        assert!(matches!(coordinator.admit(&end), Admission::Execute(_)));
+        let end_token = response_token(coordinator.admit(&end));
 
         for (sequence, command_type) in [
             (112, CommandType::Ping),
@@ -896,17 +1094,13 @@ mod tests {
             (116, CommandType::StopAll),
         ] {
             let bypass = request(2, sequence, command_type, &[]);
-            assert!(matches!(coordinator.admit(&bypass), Admission::Execute(_)));
-            coordinator
-                .complete(sequence, CachedResponse::ack(2, sequence))
-                .unwrap();
+            let token = response_token(coordinator.admit(&bypass));
+            coordinator.complete(token, token.ack()).unwrap();
             assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
         }
 
-        coordinator.cancel_batch();
-        assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
         coordinator
-            .complete(111, CachedResponse::nack(2, 111, ErrorCode::Cancelled))
+            .complete(end_token, end_token.nack(ErrorCode::Cancelled))
             .unwrap();
         assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
     }
@@ -923,19 +1117,15 @@ mod tests {
             (124, CommandType::Heartbeat),
         ] {
             let bypass = request(2, sequence, command_type, &[]);
-            assert!(matches!(coordinator.admit(&bypass), Admission::Execute(_)));
-            coordinator
-                .complete(sequence, CachedResponse::ack(2, sequence))
-                .unwrap();
+            let token = response_token(coordinator.admit(&bypass));
+            coordinator.complete(token, token.ack()).unwrap();
             assert_eq!(coordinator.batch_mode(), BatchMode::Collecting);
         }
 
         let stop = request(2, 125, CommandType::StopAll, &[]);
-        assert!(matches!(coordinator.admit(&stop), Admission::Execute(_)));
+        let stop_token = response_token(coordinator.admit(&stop));
         assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
-        coordinator
-            .complete(125, CachedResponse::ack(2, 125))
-            .unwrap();
+        coordinator.complete(stop_token, stop_token.ack()).unwrap();
 
         let stale_end = request(2, 126, CommandType::BatchEnd, &[]);
         assert_eq!(
@@ -955,7 +1145,7 @@ mod tests {
         let mut coordinator = Coordinator::new();
         let owner = request(2, 130, CommandType::MouseClick, &[1]);
         let begin = request(2, 131, CommandType::BatchBegin, &[]);
-        assert!(matches!(coordinator.admit(&owner), Admission::Execute(_)));
+        let owner_token = response_token(coordinator.admit(&owner));
         assert_eq!(
             coordinator.admit(&begin),
             Admission::Busy(BusyReason::ExecutorOccupied)
@@ -963,7 +1153,7 @@ mod tests {
         assert!(!coordinator.has_cached_sequence(131));
 
         coordinator
-            .complete(130, CachedResponse::ack(2, 130))
+            .complete(owner_token, owner_token.ack())
             .unwrap();
         assert_eq!(
             coordinator.admit(&begin),
@@ -979,7 +1169,7 @@ mod tests {
 
         for sequence in 201..263 {
             let query = request(2, sequence, CommandType::Ping, &[]);
-            assert!(matches!(coordinator.admit(&query), Admission::Execute(_)));
+            assert!(matches!(coordinator.admit(&query), Admission::Bypass(_)));
         }
 
         let saturated_query = request(2, 263, CommandType::GetInfo, &[]);
@@ -990,7 +1180,7 @@ mod tests {
         assert!(!coordinator.has_cached_sequence(263));
 
         let stop = request(2, 264, CommandType::StopAll, &[]);
-        assert!(matches!(coordinator.admit(&stop), Admission::Execute(_)));
+        assert!(matches!(coordinator.admit(&stop), Admission::Stop(_)));
         assert!(coordinator.has_cached_sequence(264));
         assert!(coordinator.has_cached_sequence(200));
         assert!(coordinator.is_executor_occupied());
@@ -1001,10 +1191,7 @@ mod tests {
         let mut coordinator = Coordinator::new();
         let original = request(2, 300, CommandType::MouseMoveRel, &[0, 1, 0, 1]);
         let conflicting = request(2, 300, CommandType::MouseMoveRel, &[0, 2, 0, 1]);
-        assert!(matches!(
-            coordinator.admit(&original),
-            Admission::Execute(_)
-        ));
+        let token = response_token(coordinator.admit(&original));
 
         let mut payload = Vec::<u8, 16>::new();
         payload.extend_from_slice(b"done").unwrap();
@@ -1014,7 +1201,7 @@ mod tests {
             command_type: CommandType::Status,
             payload,
         };
-        coordinator.complete(300, response.clone()).unwrap();
+        coordinator.complete(token, response.clone()).unwrap();
 
         assert_eq!(coordinator.admit(&original), Admission::Replay(response));
         assert_eq!(
@@ -1046,13 +1233,13 @@ mod tests {
 
         for sequence in 2..=63 {
             let query = request(2, sequence, CommandType::Ping, &[]);
-            assert!(matches!(coordinator.admit(&query), Admission::Execute(_)));
+            assert!(matches!(coordinator.admit(&query), Admission::Bypass(_)));
         }
 
         let last_normal = request(2, 64, CommandType::Ping, &[]);
         assert!(matches!(
             coordinator.admit(&last_normal),
-            Admission::Execute(_)
+            Admission::Bypass(_)
         ));
 
         let overflow = request(2, 65, CommandType::Ping, &[]);
@@ -1064,7 +1251,7 @@ mod tests {
         assert_eq!(coordinator.batch_mode(), BatchMode::Collecting);
 
         let stop = request(2, 66, CommandType::StopAll, &[]);
-        assert!(matches!(coordinator.admit(&stop), Admission::Execute(_)));
+        assert!(matches!(coordinator.admit(&stop), Admission::Stop(_)));
         assert!(coordinator.has_cached_sequence(66));
         assert!(coordinator.has_cached_sequence(2));
         assert!(coordinator.has_cached_sequence(63));
@@ -1077,7 +1264,9 @@ mod tests {
         let mut coordinator = Coordinator::new();
         coordinator.batch_state = BatchState::Collecting;
         for sequence in 1..=RESPONSE_CACHE_SIZE as u16 {
-            assert!(coordinator.insert_active(sequence, u64::from(sequence), true));
+            let frame = request(2, sequence, CommandType::Ping, &[]);
+            let mut request = unadmitted_request(&frame);
+            assert!(coordinator.insert_active(&mut request, true));
         }
 
         let stop = request(2, 100, CommandType::StopAll, &[]);
@@ -1087,5 +1276,297 @@ mod tests {
         );
         assert!(!coordinator.has_cached_sequence(100));
         assert_eq!(coordinator.batch_mode(), BatchMode::Collecting);
+    }
+
+    #[test]
+    fn late_old_session_completion_cannot_complete_reused_sequence() {
+        let frame = request(2, 400, CommandType::MouseClick, &[1]);
+        let mut coordinator = Coordinator::new();
+        let Admission::Execute(old_request) = coordinator.admit(&frame) else {
+            panic!("ordinary mutation should execute");
+        };
+        let old_token = old_request.completion_token().unwrap();
+
+        coordinator.clear_session();
+        let Admission::Execute(new_request) = coordinator.admit(&frame) else {
+            panic!("same sequence should be reusable in a new session");
+        };
+        let new_token = new_request.completion_token().unwrap();
+        assert_ne!(old_token, new_token);
+        assert_ne!(
+            old_token.session_generation(),
+            new_token.session_generation()
+        );
+
+        assert_eq!(
+            coordinator.complete(old_token, old_token.ack()),
+            Err(CompletionError::StaleCompletion)
+        );
+        assert!(coordinator.is_executor_occupied());
+        assert_eq!(
+            coordinator.admit(&frame),
+            Admission::Busy(BusyReason::ActiveDuplicate)
+        );
+
+        coordinator.complete(new_token, new_token.ack()).unwrap();
+        assert_eq!(
+            coordinator.admit(&frame),
+            Admission::Replay(new_token.ack())
+        );
+    }
+
+    #[test]
+    fn evicted_admission_token_is_stale_after_same_session_sequence_reuse() {
+        let mut coordinator = Coordinator::new();
+        let original = request(2, 401, CommandType::Ping, &[]);
+        let Admission::Bypass(old_request) = coordinator.admit(&original) else {
+            panic!("ping should use bypass dispatch");
+        };
+        let old_token = old_request.completion_token().unwrap();
+        coordinator.complete(old_token, old_token.ack()).unwrap();
+
+        for sequence in 402..=465 {
+            let frame = request(2, sequence, CommandType::Ping, &[]);
+            let Admission::Bypass(request) = coordinator.admit(&frame) else {
+                panic!("query should use bypass dispatch");
+            };
+            let token = request.completion_token().unwrap();
+            coordinator.complete(token, token.ack()).unwrap();
+        }
+        assert!(!coordinator.has_cached_sequence(401));
+
+        let Admission::Bypass(new_request) = coordinator.admit(&original) else {
+            panic!("evicted sequence should be admitted again");
+        };
+        let new_token = new_request.completion_token().unwrap();
+        assert_eq!(
+            old_token.session_generation(),
+            new_token.session_generation()
+        );
+        assert_ne!(old_token.admission_id(), new_token.admission_id());
+        assert_eq!(old_token.fingerprint(), new_token.fingerprint());
+
+        assert_eq!(
+            coordinator.complete(old_token, old_token.ack()),
+            Err(CompletionError::StaleCompletion)
+        );
+        assert_eq!(
+            coordinator.admit(&original),
+            Admission::Busy(BusyReason::ActiveDuplicate)
+        );
+        coordinator.complete(new_token, new_token.ack()).unwrap();
+    }
+
+    #[test]
+    fn completion_validates_version_and_final_response_shape_before_mutation() {
+        let mut coordinator = Coordinator::new();
+        let frame = request(2, 470, CommandType::MouseClick, &[1]);
+        let Admission::Execute(request) = coordinator.admit(&frame) else {
+            panic!("mouse click should execute exclusively");
+        };
+        let token = request.completion_token().unwrap();
+
+        assert_eq!(
+            coordinator.complete(token, CachedResponse::ack(1, token.sequence())),
+            Err(CompletionError::ResponseVersionMismatch)
+        );
+        assert_eq!(
+            coordinator.complete(
+                token,
+                CachedResponse::busy(
+                    token.version(),
+                    token.sequence(),
+                    BusyReason::ExecutorOccupied,
+                    1,
+                ),
+            ),
+            Err(CompletionError::NonFinalResponse)
+        );
+        for malformed in [
+            response_for(token, CommandType::Ack, &[1]),
+            response_for(token, CommandType::Nack, &[]),
+            response_for(token, CommandType::Nack, &[1, 2]),
+            response_for(token, CommandType::Ping, &[]),
+        ] {
+            assert_eq!(
+                coordinator.complete(token, malformed),
+                Err(CompletionError::NonFinalResponse)
+            );
+        }
+        assert!(coordinator.is_executor_occupied());
+        assert_eq!(
+            coordinator.admit(&frame),
+            Admission::Busy(BusyReason::ActiveDuplicate)
+        );
+
+        let status = response_for(token, CommandType::Status, b"done");
+        coordinator.complete(token, status.clone()).unwrap();
+        assert!(!coordinator.is_executor_occupied());
+        assert_eq!(coordinator.admit(&frame), Admission::Replay(status));
+    }
+
+    #[test]
+    fn admission_variants_expose_dispatch_mode_and_token_contract() {
+        let mut ordinary_coordinator = Coordinator::new();
+        let ordinary = request(2, 480, CommandType::MouseClick, &[1]);
+        let Admission::Execute(ordinary_request) = ordinary_coordinator.admit(&ordinary) else {
+            panic!("ordinary mutation should use exclusive execution");
+        };
+        assert_eq!(ordinary_request.version(), 2);
+        assert_eq!(ordinary_request.flags(), 0);
+        assert_eq!(ordinary_request.sequence(), 480);
+        assert_eq!(ordinary_request.command_type(), CommandType::MouseClick);
+        assert_eq!(
+            ordinary_request.request_kind(),
+            RequestKind::ResponseExpected
+        );
+        assert!(ordinary_request.completion_token().is_some());
+        assert!(matches!(
+            ordinary_request.body(),
+            OwnedRequestBody::Command(OwnedCommand::MouseClick(_))
+        ));
+
+        let mut collect_coordinator = Coordinator::new();
+        begin_batch(&mut collect_coordinator, 481);
+        let collected = request(2, 482, CommandType::WaitMs, &[0, 0, 0, 1]);
+        let Admission::Collect(collected_request) = collect_coordinator.admit(&collected) else {
+            panic!("batchable mutation should use collection dispatch");
+        };
+        assert!(collected_request.completion_token().is_some());
+
+        let mut end_coordinator = Coordinator::new();
+        begin_batch(&mut end_coordinator, 483);
+        let end = request(2, 484, CommandType::BatchEnd, &[]);
+        let Admission::Execute(end_request) = end_coordinator.admit(&end) else {
+            panic!("batch end should use exclusive execution");
+        };
+        assert_eq!(end_request.body(), &OwnedRequestBody::BatchEnd);
+        assert!(end_request.completion_token().is_some());
+
+        for command_type in [
+            CommandType::Ping,
+            CommandType::GetInfo,
+            CommandType::GetCaps,
+            CommandType::Heartbeat,
+        ] {
+            let mut coordinator = Coordinator::new();
+            let frame = request(2, 485, command_type, &[]);
+            let Admission::Bypass(request) = coordinator.admit(&frame) else {
+                panic!("read-only and diagnostic commands should bypass");
+            };
+            assert!(request.completion_token().is_some());
+        }
+
+        let mut heartbeat_coordinator = Coordinator::new();
+        let heartbeat = request_with_flags(2, FLAG_NO_RESPONSE, 0, CommandType::Heartbeat, &[]);
+        let Admission::NoResponse(heartbeat_request) = heartbeat_coordinator.admit(&heartbeat)
+        else {
+            panic!("sequence-zero heartbeat should use no-response dispatch");
+        };
+        assert_eq!(heartbeat_request.completion_token(), None);
+
+        let mut stop_coordinator = Coordinator::new();
+        let stop = request(2, 486, CommandType::StopAll, &[]);
+        let Admission::Stop(stop_request) = stop_coordinator.admit(&stop) else {
+            panic!("stop should use urgent cancellation dispatch");
+        };
+        assert!(stop_request.completion_token().is_some());
+        assert_eq!(
+            stop_request.into_body(),
+            OwnedRequestBody::Command(OwnedCommand::StopAll)
+        );
+    }
+
+    #[test]
+    fn executor_query_includes_batch_but_excludes_bypass_only_activity() {
+        let mut bypass_coordinator = Coordinator::new();
+        let ping = request(2, 490, CommandType::Ping, &[]);
+        assert!(matches!(
+            bypass_coordinator.admit(&ping),
+            Admission::Bypass(_)
+        ));
+        assert!(!bypass_coordinator.is_executor_occupied());
+
+        let mut ordinary_coordinator = Coordinator::new();
+        let ordinary = request(2, 491, CommandType::WaitMs, &[0, 0, 0, 1]);
+        assert!(matches!(
+            ordinary_coordinator.admit(&ordinary),
+            Admission::Execute(_)
+        ));
+        assert!(ordinary_coordinator.is_executor_occupied());
+
+        let mut batch_coordinator = Coordinator::new();
+        begin_batch(&mut batch_coordinator, 492);
+        let end = request(2, 493, CommandType::BatchEnd, &[]);
+        assert!(matches!(
+            batch_coordinator.admit(&end),
+            Admission::Execute(_)
+        ));
+        assert!(batch_coordinator.is_executor_occupied());
+    }
+
+    #[test]
+    fn stop_during_batch_execution_waits_for_exact_end_completion() {
+        let mut coordinator = Coordinator::new();
+        begin_batch(&mut coordinator, 500);
+        let end = request(2, 501, CommandType::BatchEnd, &[]);
+        let Admission::Execute(end_request) = coordinator.admit(&end) else {
+            panic!("batch end should execute");
+        };
+        let end_token = end_request.completion_token().unwrap();
+
+        let stop = request(2, 502, CommandType::StopAll, &[]);
+        let Admission::Stop(stop_request) = coordinator.admit(&stop) else {
+            panic!("stop should bypass active batch execution");
+        };
+        let stop_token = stop_request.completion_token().unwrap();
+        assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
+        assert!(coordinator.is_executor_occupied());
+
+        coordinator.complete(stop_token, stop_token.ack()).unwrap();
+        assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
+        assert_eq!(
+            coordinator.complete(stop_token, stop_token.nack(ErrorCode::Cancelled)),
+            Err(CompletionError::StaleCompletion)
+        );
+        assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
+
+        coordinator
+            .complete(end_token, end_token.nack(ErrorCode::Cancelled))
+            .unwrap();
+        assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
+        assert!(!coordinator.is_executor_occupied());
+    }
+
+    #[test]
+    fn late_old_batch_end_token_cannot_clear_new_session_batch_owner() {
+        let mut coordinator = Coordinator::new();
+        begin_batch(&mut coordinator, 510);
+        let old_end = request(2, 511, CommandType::BatchEnd, &[]);
+        let Admission::Execute(old_request) = coordinator.admit(&old_end) else {
+            panic!("old batch end should execute");
+        };
+        let old_token = old_request.completion_token().unwrap();
+
+        coordinator.clear_session();
+        begin_batch(&mut coordinator, 510);
+        let new_end = request(2, 511, CommandType::BatchEnd, &[]);
+        let Admission::Execute(new_request) = coordinator.admit(&new_end) else {
+            panic!("new batch end should execute");
+        };
+        let new_token = new_request.completion_token().unwrap();
+        assert_ne!(old_token, new_token);
+
+        assert_eq!(
+            coordinator.complete(old_token, old_token.nack(ErrorCode::Cancelled)),
+            Err(CompletionError::StaleCompletion)
+        );
+        assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
+        assert!(coordinator.is_executor_occupied());
+
+        coordinator
+            .complete(new_token, new_token.nack(ErrorCode::Cancelled))
+            .unwrap();
+        assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
     }
 }
