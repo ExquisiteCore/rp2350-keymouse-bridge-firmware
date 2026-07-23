@@ -1,4 +1,4 @@
-use crate::protocol::{CommandType, Frame};
+use crate::protocol::{CommandType, Frame, MAX_WAIT_MS};
 
 pub const MOD_LEFT_SHIFT: u8 = 0x02;
 
@@ -39,6 +39,7 @@ pub enum Command<'a> {
     Ping,
     GetInfo,
     GetCaps,
+    Heartbeat,
     KeyDown(KeyStroke),
     KeyUp(KeyStroke),
     KeyTap(KeyStroke),
@@ -59,6 +60,7 @@ pub enum CommandError {
     InvalidPayloadLength,
     InvalidMouseButton,
     UnsupportedCommand,
+    WaitTooLong,
 }
 
 pub fn decode_command<'a>(frame: &Frame<'a>) -> Result<Command<'a>, CommandError> {
@@ -66,6 +68,7 @@ pub fn decode_command<'a>(frame: &Frame<'a>) -> Result<Command<'a>, CommandError
         CommandType::Ping => expect_empty(frame.payload, Command::Ping),
         CommandType::GetInfo => expect_empty(frame.payload, Command::GetInfo),
         CommandType::GetCaps => expect_empty(frame.payload, Command::GetCaps),
+        CommandType::Heartbeat => expect_empty(frame.payload, Command::Heartbeat),
         CommandType::KeyDown => decode_keystroke(frame.payload).map(Command::KeyDown),
         CommandType::KeyUp => decode_keystroke(frame.payload).map(Command::KeyUp),
         CommandType::KeyTap => decode_keystroke(frame.payload).map(Command::KeyTap),
@@ -138,9 +141,12 @@ fn decode_wait_ms(payload: &[u8]) -> Result<Command<'_>, CommandError> {
         return Err(CommandError::InvalidPayloadLength);
     }
 
-    Ok(Command::WaitMs(u32::from_be_bytes([
-        payload[0], payload[1], payload[2], payload[3],
-    ])))
+    let wait_ms = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if wait_ms > MAX_WAIT_MS {
+        return Err(CommandError::WaitTooLong);
+    }
+
+    Ok(Command::WaitMs(wait_ms))
 }
 
 pub fn ascii_to_keystroke(byte: u8) -> Option<KeyStroke> {
@@ -291,5 +297,37 @@ mod tests {
         let error = decode_command(&frame(CommandType::MouseMoveRel, &[1, 2, 3])).unwrap_err();
 
         assert_eq!(error, CommandError::InvalidPayloadLength);
+    }
+
+    #[test]
+    fn decodes_empty_heartbeat() {
+        assert_eq!(
+            decode_command(&frame(CommandType::Heartbeat, &[])),
+            Ok(Command::Heartbeat)
+        );
+        assert_eq!(
+            decode_command(&frame(CommandType::Heartbeat, &[1])),
+            Err(CommandError::InvalidPayloadLength)
+        );
+    }
+
+    #[test]
+    fn wait_is_limited_to_sixty_seconds() {
+        let frame = Frame {
+            version: 2,
+            flags: 0,
+            sequence: 9,
+            command_type: CommandType::WaitMs,
+            payload: &[0, 0, 0xEA, 0x61],
+        };
+        assert_eq!(decode_command(&frame), Err(CommandError::WaitTooLong));
+    }
+
+    #[test]
+    fn wait_accepts_exactly_sixty_seconds() {
+        assert_eq!(
+            decode_command(&frame(CommandType::WaitMs, &[0, 0, 0xEA, 0x60])),
+            Ok(Command::WaitMs(MAX_WAIT_MS))
+        );
     }
 }

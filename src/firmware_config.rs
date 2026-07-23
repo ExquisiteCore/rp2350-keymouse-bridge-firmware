@@ -1,8 +1,8 @@
 //! 固件协议、USB 和 HID 行为配置。
 
 use crate::protocol::MAX_PAYLOAD_SIZE;
+pub use crate::protocol::PROTOCOL_VERSION;
 
-pub const PROTOCOL_VERSION: u8 = 1;
 pub const USB_VENDOR_ID: u16 = 0xCAFE;
 pub const USB_PRODUCT_ID: u16 = 0x2350;
 
@@ -14,6 +14,8 @@ const CAP_MOUSE: u16 = 1 << 1;
 const CAP_ASCII: u16 = 1 << 2;
 const CAP_BATCH: u16 = 1 << 3;
 const CAP_RETRY_SAFE: u16 = 1 << 4;
+const CAP_LEASE: u16 = 1 << 5;
+const CAP_CANCELLATION: u16 = 1 << 6;
 
 pub fn info_payload() -> [u8; 4] {
     [
@@ -24,8 +26,11 @@ pub fn info_payload() -> [u8; 4] {
     ]
 }
 
-pub fn capability_payload() -> [u8; 10] {
-    let caps = CAP_KEYBOARD | CAP_MOUSE | CAP_ASCII | CAP_BATCH | CAP_RETRY_SAFE;
+pub fn capability_payload(request_version: u8) -> [u8; 10] {
+    let mut caps = CAP_KEYBOARD | CAP_MOUSE | CAP_ASCII | CAP_BATCH;
+    if request_version == PROTOCOL_VERSION {
+        caps |= CAP_RETRY_SAFE | CAP_LEASE | CAP_CANCELLATION;
+    }
     [
         PROTOCOL_VERSION,
         (MAX_PAYLOAD_SIZE >> 8) as u8,
@@ -43,17 +48,22 @@ pub fn capability_payload() -> [u8; 10] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::LEGACY_PROTOCOL_VERSION;
 
     #[test]
     fn info_payload_reports_protocol_limits() {
-        assert_eq!(info_payload(), [1, 0, 240, 0x03]);
+        assert_eq!(info_payload(), [2, 0, 240, 0x03]);
     }
 
     #[test]
-    fn capability_payload_reports_supported_features_and_delays() {
+    fn capability_payload_gates_v2_features_by_request_version() {
         assert_eq!(
-            capability_payload(),
-            [1, 0, 240, 0, 0b0001_1111, 1, 1, 0, 8, 20]
+            capability_payload(LEGACY_PROTOCOL_VERSION),
+            [2, 0, 240, 0, 0b0000_1111, 1, 1, 0, 8, 20]
+        );
+        assert_eq!(
+            capability_payload(PROTOCOL_VERSION),
+            [2, 0, 240, 0, 0b0111_1111, 1, 1, 0, 8, 20]
         );
     }
 }

@@ -1,4 +1,8 @@
 pub const MAGIC: [u8; 2] = [0xA5, 0x5A];
+pub const LEGACY_PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
+pub const FLAG_NO_RESPONSE: u8 = 0x01;
+pub const MAX_WAIT_MS: u32 = 60_000;
 pub const MAX_PAYLOAD_SIZE: usize = 240;
 pub const FRAME_OVERHEAD: usize = 11;
 pub const MAX_FRAME_SIZE: usize = FRAME_OVERHEAD + MAX_PAYLOAD_SIZE;
@@ -8,6 +12,7 @@ pub enum CommandType {
     Ping,
     GetInfo,
     GetCaps,
+    Heartbeat,
     KeyDown,
     KeyUp,
     KeyTap,
@@ -34,6 +39,7 @@ impl CommandType {
             0x01 => Self::Ping,
             0x02 => Self::GetInfo,
             0x03 => Self::GetCaps,
+            0x04 => Self::Heartbeat,
             0x10 => Self::KeyDown,
             0x11 => Self::KeyUp,
             0x12 => Self::KeyTap,
@@ -60,6 +66,7 @@ impl CommandType {
             Self::Ping => 0x01,
             Self::GetInfo => 0x02,
             Self::GetCaps => 0x03,
+            Self::Heartbeat => 0x04,
             Self::KeyDown => 0x10,
             Self::KeyUp => 0x11,
             Self::KeyTap => 0x12,
@@ -92,6 +99,19 @@ pub struct Frame<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestKind {
+    ResponseExpected,
+    NoResponseHeartbeat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestError {
+    UnsupportedVersion,
+    UnsupportedFlags,
+    InvalidSequence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
     TooShort,
     BadMagic,
@@ -113,6 +133,17 @@ pub fn encode_frame(
     payload: &[u8],
     out: &mut [u8],
 ) -> Result<usize, EncodeError> {
+    encode_frame_with_flags(version, 0, sequence, command_type, payload, out)
+}
+
+pub fn encode_frame_with_flags(
+    version: u8,
+    flags: u8,
+    sequence: u16,
+    command_type: CommandType,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, EncodeError> {
     if payload.len() > MAX_PAYLOAD_SIZE {
         return Err(EncodeError::PayloadTooLong);
     }
@@ -124,7 +155,7 @@ pub fn encode_frame(
 
     out[0..2].copy_from_slice(&MAGIC);
     out[2] = version;
-    out[3] = 0;
+    out[3] = flags;
     out[4..6].copy_from_slice(&sequence.to_be_bytes());
     out[6] = command_type.as_byte();
     out[7..9].copy_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -135,6 +166,25 @@ pub fn encode_frame(
     out[crc_offset..crc_offset + 2].copy_from_slice(&crc.to_be_bytes());
 
     Ok(total_len)
+}
+
+pub fn validate_request(frame: &Frame<'_>) -> Result<RequestKind, RequestError> {
+    match frame.version {
+        LEGACY_PROTOCOL_VERSION if frame.flags != 0 => Err(RequestError::UnsupportedFlags),
+        LEGACY_PROTOCOL_VERSION if frame.sequence == 0 => Err(RequestError::InvalidSequence),
+        LEGACY_PROTOCOL_VERSION => Ok(RequestKind::ResponseExpected),
+        PROTOCOL_VERSION
+            if frame.command_type == CommandType::Heartbeat
+                && frame.flags == FLAG_NO_RESPONSE
+                && frame.sequence == 0 =>
+        {
+            Ok(RequestKind::NoResponseHeartbeat)
+        }
+        PROTOCOL_VERSION if frame.flags != 0 => Err(RequestError::UnsupportedFlags),
+        PROTOCOL_VERSION if frame.sequence == 0 => Err(RequestError::InvalidSequence),
+        PROTOCOL_VERSION => Ok(RequestKind::ResponseExpected),
+        _ => Err(RequestError::UnsupportedVersion),
+    }
 }
 
 pub fn decode_frame(input: &[u8]) -> Result<Frame<'_>, DecodeError> {
@@ -224,5 +274,141 @@ mod tests {
         let frame = [0xA5, 0x5A, 1, 0, 0, 1, 0x01, 0, 4, 0, 0];
 
         assert_eq!(decode_frame(&frame), Err(DecodeError::LengthMismatch));
+    }
+
+    #[test]
+    fn v2_heartbeat_supports_no_response_flag() {
+        let mut buf = [0u8; MAX_FRAME_SIZE];
+        let len = encode_frame_with_flags(
+            2,
+            FLAG_NO_RESPONSE,
+            0,
+            CommandType::Heartbeat,
+            &[],
+            &mut buf,
+        )
+        .unwrap();
+        let frame = decode_frame(&buf[..len]).unwrap();
+        assert_eq!(
+            validate_request(&frame),
+            Ok(RequestKind::NoResponseHeartbeat)
+        );
+    }
+
+    #[test]
+    fn v1_rejects_flags_and_v2_rejects_zero_command_sequence() {
+        let v1 = Frame {
+            version: 1,
+            flags: FLAG_NO_RESPONSE,
+            sequence: 1,
+            command_type: CommandType::Ping,
+            payload: &[],
+        };
+        assert_eq!(validate_request(&v1), Err(RequestError::UnsupportedFlags));
+
+        let v2 = Frame {
+            version: 2,
+            flags: 0,
+            sequence: 0,
+            command_type: CommandType::Ping,
+            payload: &[],
+        };
+        assert_eq!(validate_request(&v2), Err(RequestError::InvalidSequence));
+    }
+
+    #[test]
+    fn heartbeat_wire_id_is_stable() {
+        assert_eq!(CommandType::Heartbeat.as_byte(), 0x04);
+        assert_eq!(CommandType::from_byte(0x04), CommandType::Heartbeat);
+    }
+
+    #[test]
+    fn encode_frame_remains_a_zero_flags_wrapper() {
+        let mut legacy = [0u8; MAX_FRAME_SIZE];
+        let mut explicit = [0u8; MAX_FRAME_SIZE];
+        let legacy_len = encode_frame(2, 8, CommandType::Ping, b"ok", &mut legacy).unwrap();
+        let explicit_len =
+            encode_frame_with_flags(2, 0, 8, CommandType::Ping, b"ok", &mut explicit).unwrap();
+
+        assert_eq!(&legacy[..legacy_len], &explicit[..explicit_len]);
+    }
+
+    #[test]
+    fn crc_covers_version_and_flags() {
+        let mut buf = [0u8; MAX_FRAME_SIZE];
+        let len = encode_frame_with_flags(
+            2,
+            FLAG_NO_RESPONSE,
+            0,
+            CommandType::Heartbeat,
+            &[],
+            &mut buf,
+        )
+        .unwrap();
+
+        let mut changed_version = buf;
+        changed_version[2] = 1;
+        assert_eq!(
+            decode_frame(&changed_version[..len]),
+            Err(DecodeError::BadCrc)
+        );
+
+        let mut changed_flags = buf;
+        changed_flags[3] = 0;
+        assert_eq!(
+            decode_frame(&changed_flags[..len]),
+            Err(DecodeError::BadCrc)
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_heartbeat_combinations_and_versions() {
+        let flagged_with_sequence = Frame {
+            version: PROTOCOL_VERSION,
+            flags: FLAG_NO_RESPONSE,
+            sequence: 1,
+            command_type: CommandType::Heartbeat,
+            payload: &[],
+        };
+        assert_eq!(
+            validate_request(&flagged_with_sequence),
+            Err(RequestError::UnsupportedFlags)
+        );
+
+        let unflagged_without_sequence = Frame {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            sequence: 0,
+            command_type: CommandType::Heartbeat,
+            payload: &[],
+        };
+        assert_eq!(
+            validate_request(&unflagged_without_sequence),
+            Err(RequestError::InvalidSequence)
+        );
+
+        let legacy_without_sequence = Frame {
+            version: LEGACY_PROTOCOL_VERSION,
+            flags: 0,
+            sequence: 0,
+            command_type: CommandType::Ping,
+            payload: &[],
+        };
+        assert_eq!(
+            validate_request(&legacy_without_sequence),
+            Err(RequestError::InvalidSequence)
+        );
+
+        let unknown_version = Frame {
+            version: PROTOCOL_VERSION + 1,
+            flags: 0,
+            sequence: 1,
+            command_type: CommandType::Ping,
+            payload: &[],
+        };
+        assert_eq!(
+            validate_request(&unknown_version),
+            Err(RequestError::UnsupportedVersion)
+        );
     }
 }
