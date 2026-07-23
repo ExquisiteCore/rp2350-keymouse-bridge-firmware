@@ -2,6 +2,7 @@
 
 use crate::protocol::MAX_PAYLOAD_SIZE;
 pub use crate::protocol::PROTOCOL_VERSION;
+pub use crate::safety::{CONTROL_LEASE_MS, HEARTBEAT_INTERVAL_MS, PARTIAL_FRAME_TIMEOUT_MS};
 
 pub const USB_VENDOR_ID: u16 = 0xCAFE;
 pub const USB_PRODUCT_ID: u16 = 0x2350;
@@ -65,5 +66,12 @@ mod tests {
             capability_payload(PROTOCOL_VERSION),
             [2, 0, 240, 0, 0b0111_1111, 1, 1, 0, 8, 20]
         );
+    }
+
+    #[test]
+    fn safety_intervals_are_available_to_firmware_runtime() {
+        assert_eq!(PARTIAL_FRAME_TIMEOUT_MS, 250);
+        assert_eq!(HEARTBEAT_INTERVAL_MS, 500);
+        assert_eq!(CONTROL_LEASE_MS, 2_000);
     }
 }

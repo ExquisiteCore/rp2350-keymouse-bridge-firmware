@@ -10,6 +10,7 @@ pub mod input_state;
 pub mod led;
 pub mod owned_command;
 pub mod protocol;
+pub mod safety;
 pub mod usb_identity;
 
 pub use protocol::{
