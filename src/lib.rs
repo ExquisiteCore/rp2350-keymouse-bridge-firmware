@@ -4,6 +4,7 @@ pub mod commands;
 pub mod error;
 pub mod firmware_config;
 pub mod frame_stream;
+pub mod input_state;
 pub mod led;
 pub mod protocol;
 pub mod usb_identity;

@@ -5,6 +5,9 @@ name = "rp2350-keymouse-bridge-firmware"
 version = "0.1.0"
 license = "MIT or Apache-2.0"
 
+[dependencies]
+heapless = "0.9"
+
 [target."thumbv8m.main-none-eabihf".dependencies]
 cortex-m-rt = "0.7"
 defmt = "1"

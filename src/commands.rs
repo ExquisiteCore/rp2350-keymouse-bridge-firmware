@@ -197,6 +197,14 @@ pub fn ascii_to_keystroke(byte: u8) -> Option<KeyStroke> {
     Some(KeyStroke { modifier, keycode })
 }
 
+pub(crate) fn ascii_to_keystroke_with_caps_lock(byte: u8, caps_lock: bool) -> Option<KeyStroke> {
+    let mut stroke = ascii_to_keystroke(byte)?;
+    if caps_lock && byte.is_ascii_alphabetic() {
+        stroke.modifier ^= MOD_LEFT_SHIFT;
+    }
+    Some(stroke)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
