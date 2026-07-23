@@ -1,28 +1,111 @@
 use crate::commands::{CommandError, decode_command};
 use crate::error::ErrorCode;
 use crate::owned_command::OwnedCommand;
-use crate::protocol::{CommandType, Frame, RequestKind, validate_request};
+use crate::protocol::{CommandType, Frame, MAX_PAYLOAD_SIZE, RequestKind, validate_request};
 use heapless::Vec;
 
+/// Maximum number of active and replayable responses retained per session.
 pub const RESPONSE_CACHE_SIZE: usize = 64;
 
+/// Stable wire reason returned with an interim BUSY response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum BusyReason {
+    /// An identical request with this sequence is still active.
     ActiveDuplicate = 1,
+    /// A collected batch currently owns exclusive execution.
     BatchExecuting = 2,
+    /// An ordinary executor job or admission capacity is occupied.
     ExecutorOccupied = 3,
 }
 
+/// Raw allocation-free envelope copied by the receiver into the dispatcher channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingRequest {
+    version: u8,
+    flags: u8,
+    sequence: u16,
+    command_type: CommandType,
+    payload: Vec<u8, MAX_PAYLOAD_SIZE>,
+}
+
+/// Failure to copy a borrowed frame into an owned receiver envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncomingRequestError {
+    /// The payload exceeds the protocol's fixed 240-byte channel capacity.
+    PayloadTooLong,
+}
+
+impl IncomingRequest {
+    /// Copies a borrowed frame without decoding command semantics or mutating coordinator state.
+    pub fn from_frame(frame: &Frame<'_>) -> Result<Self, IncomingRequestError> {
+        let mut payload = Vec::new();
+        payload
+            .extend_from_slice(frame.payload)
+            .map_err(|_| IncomingRequestError::PayloadTooLong)?;
+        Ok(Self {
+            version: frame.version,
+            flags: frame.flags,
+            sequence: frame.sequence,
+            command_type: frame.command_type,
+            payload,
+        })
+    }
+
+    /// Returns the received protocol version.
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Returns the received request flags.
+    pub const fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Returns the received request sequence.
+    pub const fn sequence(&self) -> u16 {
+        self.sequence
+    }
+
+    /// Returns the received command type without decoding its payload.
+    pub const fn command_type(&self) -> CommandType {
+        self.command_type
+    }
+
+    /// Returns the owned raw payload copied from the receiver buffer.
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    fn as_frame(&self) -> Frame<'_> {
+        Frame {
+            version: self.version,
+            flags: self.flags,
+            sequence: self.sequence,
+            command_type: self.command_type,
+            payload: self.payload.as_slice(),
+        }
+    }
+}
+
+/// Failure to construct a bounded cached response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CachedResponseError {
+    /// The response payload exceeds the fixed 16-byte cache capacity.
+    PayloadTooLong,
+}
+
+/// Bounded wire response retained for exact retry replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CachedResponse {
-    pub version: u8,
-    pub sequence: u16,
-    pub command_type: CommandType,
-    pub payload: Vec<u8, 16>,
+    version: u8,
+    sequence: u16,
+    command_type: CommandType,
+    payload: Vec<u8, 16>,
 }
 
 impl CachedResponse {
+    /// Builds an empty ACK response.
     pub fn ack(version: u8, sequence: u16) -> Self {
         Self {
             version,
@@ -32,6 +115,7 @@ impl CachedResponse {
         }
     }
 
+    /// Builds a typed one-byte NACK response.
     pub fn nack(version: u8, sequence: u16, error: ErrorCode) -> Self {
         let mut payload = Vec::new();
         let pushed = payload.push(error as u8);
@@ -44,6 +128,7 @@ impl CachedResponse {
         }
     }
 
+    /// Builds an interim BUSY response with a big-endian retry delay.
     pub fn busy(version: u8, sequence: u16, reason: BusyReason, retry_ms: u16) -> Self {
         let mut payload = Vec::new();
         let pushed = payload.extend_from_slice(&[
@@ -59,6 +144,40 @@ impl CachedResponse {
             payload,
         }
     }
+
+    /// Builds a bounded STATUS response.
+    pub fn status(version: u8, sequence: u16, payload: &[u8]) -> Result<Self, CachedResponseError> {
+        let mut owned = Vec::new();
+        owned
+            .extend_from_slice(payload)
+            .map_err(|_| CachedResponseError::PayloadTooLong)?;
+        Ok(Self {
+            version,
+            sequence,
+            command_type: CommandType::Status,
+            payload: owned,
+        })
+    }
+
+    /// Returns the response protocol version.
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Returns the response sequence.
+    pub const fn sequence(&self) -> u16 {
+        self.sequence
+    }
+
+    /// Returns the response command type.
+    pub const fn command_type(&self) -> CommandType {
+        self.command_type
+    }
+
+    /// Returns the bounded response payload.
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
 }
 
 /// Opaque identity for completing one exact accepted request.
@@ -69,6 +188,13 @@ pub struct CompletionToken {
     version: u8,
     sequence: u16,
     fingerprint: u64,
+    expected_response: ExpectedFinalResponse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedFinalResponse {
+    Ack,
+    Status,
 }
 
 impl CompletionToken {
@@ -178,6 +304,7 @@ impl OwnedRequest {
 }
 
 /// Coordinator decision that makes dispatcher scheduling semantics explicit.
+#[must_use = "admission decisions must be dispatched, replayed, or rejected"]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Admission {
     /// Run an exclusive ordinary mutation or execute a completed batch.
@@ -213,10 +340,14 @@ pub enum CompletionError {
     NonFinalResponse,
 }
 
+/// Batch collection and exclusive execution lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BatchMode {
+    /// No batch is open or executing.
     Idle,
+    /// Batchable commands are being collected by the dispatcher.
     Collecting,
+    /// A completed batch owns exclusive execution.
     Executing,
 }
 
@@ -250,6 +381,7 @@ struct CacheEntry {
     state: CacheState,
 }
 
+/// Stateful admission, deduplication, replay, and execution-lifecycle coordinator.
 pub struct Coordinator {
     cache: Vec<CacheEntry, RESPONSE_CACHE_SIZE>,
     next_evict: usize,
@@ -260,6 +392,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    /// Creates an idle coordinator in its initial session generation.
     pub const fn new() -> Self {
         Self {
             cache: Vec::new(),
@@ -271,6 +404,7 @@ impl Coordinator {
         }
     }
 
+    /// Reports whether the current session cache contains this sequence.
     pub fn has_cached_sequence(&self, sequence: u16) -> bool {
         self.cache.iter().any(|entry| entry.sequence == sequence)
     }
@@ -280,6 +414,7 @@ impl Coordinator {
         self.executor_owner.is_some() || matches!(self.batch_state, BatchState::Executing { .. })
     }
 
+    /// Returns the current batch lifecycle mode.
     pub const fn batch_mode(&self) -> BatchMode {
         match self.batch_state {
             BatchState::Idle => BatchMode::Idle,
@@ -300,7 +435,18 @@ impl Coordinator {
         self.batch_state = BatchState::Idle;
     }
 
+    /// Compatibility wrapper over the same dispatcher-side admission semantics.
     pub fn admit(&mut self, frame: &Frame<'_>) -> Admission {
+        self.admit_frame(frame)
+    }
+
+    /// Consumes a receiver-owned envelope and applies dispatcher-side admission semantics.
+    pub fn admit_owned(&mut self, request: IncomingRequest) -> Admission {
+        let frame = request.as_frame();
+        self.admit_frame(&frame)
+    }
+
+    fn admit_frame(&mut self, frame: &Frame<'_>) -> Admission {
         let request_kind = match validate_request(frame) {
             Ok(kind) => kind,
             Err(error) => return Admission::Reject(error.into()),
@@ -358,7 +504,7 @@ impl Coordinator {
         if response.version != token.version {
             return Err(CompletionError::ResponseVersionMismatch);
         }
-        if !is_final_response(&response) {
+        if !is_final_response(&response, token.expected_response) {
             return Err(CompletionError::NonFinalResponse);
         }
         let entry = self
@@ -513,15 +659,27 @@ impl Coordinator {
             version: request.version,
             sequence: request.sequence,
             fingerprint: request.fingerprint,
+            expected_response: expected_final_response(request.command_type),
         })
     }
 }
 
-fn is_final_response(response: &CachedResponse) -> bool {
+fn expected_final_response(command_type: CommandType) -> ExpectedFinalResponse {
+    match command_type {
+        CommandType::GetInfo | CommandType::GetCaps => ExpectedFinalResponse::Status,
+        _ => ExpectedFinalResponse::Ack,
+    }
+}
+
+fn is_final_response(response: &CachedResponse, expected_response: ExpectedFinalResponse) -> bool {
     match response.command_type {
-        CommandType::Ack => response.payload.is_empty(),
-        CommandType::Nack => response.payload.len() == 1,
-        CommandType::Status => true,
+        CommandType::Ack => {
+            expected_response == ExpectedFinalResponse::Ack && response.payload.is_empty()
+        }
+        CommandType::Nack => {
+            response.payload.len() == 1 && ErrorCode::from_byte(response.payload[0]).is_some()
+        }
+        CommandType::Status => expected_response == ExpectedFinalResponse::Status,
         _ => false,
     }
 }
@@ -578,7 +736,7 @@ fn fingerprint(frame: &Frame<'_>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{CommandType, FLAG_NO_RESPONSE, Frame, MAX_WAIT_MS};
+    use crate::protocol::{CommandType, FLAG_NO_RESPONSE, Frame, MAX_PAYLOAD_SIZE, MAX_WAIT_MS};
 
     fn request<'a>(
         version: u8,
@@ -637,6 +795,15 @@ mod tests {
         request
             .completion_token()
             .expect("response-bearing admission must carry a token")
+    }
+
+    fn success_response(token: CompletionToken, command_type: CommandType) -> CachedResponse {
+        match command_type {
+            CommandType::GetInfo | CommandType::GetCaps => {
+                CachedResponse::status(token.version(), token.sequence(), &[]).unwrap()
+            }
+            _ => token.ack(),
+        }
     }
 
     fn unadmitted_request(frame: &Frame<'_>) -> OwnedRequest {
@@ -844,7 +1011,9 @@ mod tests {
         for sequence in 2..=RESPONSE_CACHE_SIZE as u16 {
             let frame = request(2, sequence, CommandType::GetInfo, &[]);
             let token = response_token(coordinator.admit(&frame));
-            coordinator.complete(token, token.ack()).unwrap();
+            coordinator
+                .complete(token, success_response(token, CommandType::GetInfo))
+                .unwrap();
         }
 
         let churn = request(2, 65, CommandType::GetCaps, &[]);
@@ -893,7 +1062,9 @@ mod tests {
         ] {
             let bypass = request(2, sequence, command_type, &[]);
             let token = response_token(coordinator.admit(&bypass));
-            coordinator.complete(token, token.ack()).unwrap();
+            coordinator
+                .complete(token, success_response(token, command_type))
+                .unwrap();
             assert!(coordinator.is_executor_occupied());
 
             let ordinary = request(2, sequence + 100, CommandType::MouseClick, &[1]);
@@ -1062,7 +1233,10 @@ mod tests {
         let query = request(2, 103, CommandType::GetInfo, &[]);
         let query_token = response_token(coordinator.admit(&query));
         coordinator
-            .complete(query_token, query_token.ack())
+            .complete(
+                query_token,
+                success_response(query_token, CommandType::GetInfo),
+            )
             .unwrap();
         assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
         assert_eq!(
@@ -1095,7 +1269,9 @@ mod tests {
         ] {
             let bypass = request(2, sequence, command_type, &[]);
             let token = response_token(coordinator.admit(&bypass));
-            coordinator.complete(token, token.ack()).unwrap();
+            coordinator
+                .complete(token, success_response(token, command_type))
+                .unwrap();
             assert_eq!(coordinator.batch_mode(), BatchMode::Executing);
         }
 
@@ -1118,7 +1294,9 @@ mod tests {
         ] {
             let bypass = request(2, sequence, command_type, &[]);
             let token = response_token(coordinator.admit(&bypass));
-            coordinator.complete(token, token.ack()).unwrap();
+            coordinator
+                .complete(token, success_response(token, command_type))
+                .unwrap();
             assert_eq!(coordinator.batch_mode(), BatchMode::Collecting);
         }
 
@@ -1193,14 +1371,7 @@ mod tests {
         let conflicting = request(2, 300, CommandType::MouseMoveRel, &[0, 2, 0, 1]);
         let token = response_token(coordinator.admit(&original));
 
-        let mut payload = Vec::<u8, 16>::new();
-        payload.extend_from_slice(b"done").unwrap();
-        let response = CachedResponse {
-            version: 2,
-            sequence: 300,
-            command_type: CommandType::Status,
-            payload,
-        };
+        let response = token.ack();
         coordinator.complete(token, response.clone()).unwrap();
 
         assert_eq!(coordinator.admit(&original), Admission::Replay(response));
@@ -1400,9 +1571,16 @@ mod tests {
         );
 
         let status = response_for(token, CommandType::Status, b"done");
-        coordinator.complete(token, status.clone()).unwrap();
+        assert_eq!(
+            coordinator.complete(token, status),
+            Err(CompletionError::NonFinalResponse)
+        );
+        assert!(coordinator.is_executor_occupied());
+
+        let ack = token.ack();
+        coordinator.complete(token, ack.clone()).unwrap();
         assert!(!coordinator.is_executor_occupied());
-        assert_eq!(coordinator.admit(&frame), Admission::Replay(status));
+        assert_eq!(coordinator.admit(&frame), Admission::Replay(ack));
     }
 
     #[test]
@@ -1568,5 +1746,176 @@ mod tests {
             .complete(new_token, new_token.nack(ErrorCode::Cancelled))
             .unwrap();
         assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
+    }
+
+    #[test]
+    fn checked_cached_response_api_exposes_wire_fields_and_capacity() {
+        let ack = CachedResponse::ack(2, 600);
+        assert_eq!(ack.version(), 2);
+        assert_eq!(ack.sequence(), 600);
+        assert_eq!(ack.command_type(), CommandType::Ack);
+        assert_eq!(ack.payload(), &[]);
+
+        let maximum = [0xA5; 16];
+        let status = CachedResponse::status(2, 601, &maximum).unwrap();
+        assert_eq!(status.version(), 2);
+        assert_eq!(status.sequence(), 601);
+        assert_eq!(status.command_type(), CommandType::Status);
+        assert_eq!(status.payload(), maximum.as_slice());
+        assert_eq!(
+            CachedResponse::status(2, 602, &[0; 17]),
+            Err(CachedResponseError::PayloadTooLong)
+        );
+    }
+
+    #[test]
+    fn info_and_caps_require_status_instead_of_ack() {
+        let info = [1, 2, 3, 4];
+        let caps = [0x55; 10];
+        for (sequence, command_type, payload) in [
+            (610, CommandType::GetInfo, info.as_slice()),
+            (611, CommandType::GetCaps, caps.as_slice()),
+        ] {
+            let mut coordinator = Coordinator::new();
+            let frame = request(2, sequence, command_type, &[]);
+            let Admission::Bypass(request) = coordinator.admit(&frame) else {
+                panic!("query should use bypass dispatch");
+            };
+            let token = request.completion_token().unwrap();
+
+            assert_eq!(
+                coordinator.complete(token, token.ack()),
+                Err(CompletionError::NonFinalResponse)
+            );
+            assert_eq!(
+                coordinator.admit(&frame),
+                Admission::Busy(BusyReason::ActiveDuplicate)
+            );
+
+            let status =
+                CachedResponse::status(token.version(), token.sequence(), payload).unwrap();
+            coordinator.complete(token, status.clone()).unwrap();
+            assert_eq!(coordinator.admit(&frame), Admission::Replay(status));
+        }
+    }
+
+    #[test]
+    fn nack_requires_a_defined_error_byte_but_is_final_for_either_class() {
+        for (sequence, command_type, payload) in [
+            (620, CommandType::MouseClick, &[1][..]),
+            (621, CommandType::GetInfo, &[][..]),
+        ] {
+            let mut coordinator = Coordinator::new();
+            let frame = request(2, sequence, command_type, payload);
+            let admission = coordinator.admit(&frame);
+            let token = response_token(admission);
+
+            for malformed in [
+                response_for(token, CommandType::Nack, &[]),
+                response_for(token, CommandType::Nack, &[0]),
+                response_for(token, CommandType::Nack, &[1, 2]),
+                response_for(token, CommandType::Nack, &[u8::MAX]),
+            ] {
+                assert_eq!(
+                    coordinator.complete(token, malformed),
+                    Err(CompletionError::NonFinalResponse)
+                );
+            }
+
+            let nack = token.nack(ErrorCode::Cancelled);
+            coordinator.complete(token, nack.clone()).unwrap();
+            assert_eq!(coordinator.admit(&frame), Admission::Replay(nack));
+        }
+    }
+
+    #[test]
+    fn incoming_request_accepts_wire_capacity_and_owns_source_bytes() {
+        let mut source = [b'a'; MAX_PAYLOAD_SIZE];
+        let frame = request(2, 630, CommandType::TypeAscii, &source);
+        let incoming = IncomingRequest::from_frame(&frame).unwrap();
+
+        source[0] = b'z';
+        assert_eq!(source[0], b'z');
+        assert_eq!(incoming.version(), 2);
+        assert_eq!(incoming.flags(), 0);
+        assert_eq!(incoming.sequence(), 630);
+        assert_eq!(incoming.command_type(), CommandType::TypeAscii);
+        assert_eq!(incoming.payload().len(), MAX_PAYLOAD_SIZE);
+        assert_eq!(incoming.payload()[0], b'a');
+
+        let oversized = [0u8; MAX_PAYLOAD_SIZE + 1];
+        assert_eq!(
+            IncomingRequest::from_frame(&request(2, 631, CommandType::Ping, &oversized)),
+            Err(IncomingRequestError::PayloadTooLong)
+        );
+    }
+
+    #[test]
+    fn receiver_copy_survives_buffer_reuse_before_dispatcher_admission() {
+        let mut source = [0, 1, 0, 2];
+        let frame = request(2, 640, CommandType::MouseMoveRel, &source);
+        let incoming = IncomingRequest::from_frame(&frame).unwrap();
+        source.fill(0x7F);
+
+        let mut coordinator = Coordinator::new();
+        let Admission::Execute(request) = coordinator.admit_owned(incoming) else {
+            panic!("owned request should execute after crossing the channel boundary");
+        };
+        assert_eq!(
+            request.body(),
+            &OwnedRequestBody::Command(OwnedCommand::MouseMoveRel { dx: 1, dy: 2 })
+        );
+        let token = request.completion_token().unwrap();
+        coordinator.complete(token, token.ack()).unwrap();
+    }
+
+    #[test]
+    fn owned_admission_matches_borrowed_semantics_and_conflict_precedence() {
+        let execute = request(2, 650, CommandType::MouseClick, &[1]);
+        let mut borrowed = Coordinator::new();
+        let mut owned = Coordinator::new();
+        let borrowed_execute = borrowed.admit(&execute);
+        let owned_execute = owned.admit_owned(IncomingRequest::from_frame(&execute).unwrap());
+        assert_eq!(borrowed_execute, owned_execute);
+
+        let borrowed_token = response_token(borrowed_execute);
+        let owned_token = response_token(owned_execute);
+        borrowed
+            .complete(borrowed_token, borrowed_token.ack())
+            .unwrap();
+        owned.complete(owned_token, owned_token.ack()).unwrap();
+        assert_eq!(
+            borrowed.admit(&execute),
+            owned.admit_owned(IncomingRequest::from_frame(&execute).unwrap())
+        );
+
+        let base = request(2, 651, CommandType::MouseClick, &[1]);
+        let malformed_conflict = request(2, 651, CommandType::MouseClick, &[]);
+        let mut borrowed = Coordinator::new();
+        let mut owned = Coordinator::new();
+        assert_eq!(
+            borrowed.admit(&base),
+            owned.admit_owned(IncomingRequest::from_frame(&base).unwrap())
+        );
+        assert_eq!(
+            borrowed.admit(&malformed_conflict),
+            Admission::Reject(ErrorCode::SequenceConflict)
+        );
+        assert_eq!(
+            owned.admit_owned(IncomingRequest::from_frame(&malformed_conflict).unwrap()),
+            Admission::Reject(ErrorCode::SequenceConflict)
+        );
+
+        let invalid = request(2, 652, CommandType::MouseClick, &[]);
+        assert_eq!(
+            Coordinator::new().admit(&invalid),
+            Coordinator::new().admit_owned(IncomingRequest::from_frame(&invalid).unwrap())
+        );
+
+        let no_response = request_with_flags(2, FLAG_NO_RESPONSE, 0, CommandType::Heartbeat, &[]);
+        assert_eq!(
+            Coordinator::new().admit(&no_response),
+            Coordinator::new().admit_owned(IncomingRequest::from_frame(&no_response).unwrap())
+        );
     }
 }

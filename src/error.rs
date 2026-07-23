@@ -25,6 +25,29 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Decodes a defined wire error identifier.
+    pub const fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::BadFrame),
+            2 => Some(Self::BadCommand),
+            3 => Some(Self::UnsupportedAscii),
+            4 => Some(Self::HidWrite),
+            5 => Some(Self::Transport),
+            6 => Some(Self::FrameTooLong),
+            7 => Some(Self::UnsupportedVersion),
+            8 => Some(Self::UnsupportedFlags),
+            9 => Some(Self::InvalidSequence),
+            10 => Some(Self::SequenceConflict),
+            11 => Some(Self::BatchState),
+            12 => Some(Self::BatchCapacity),
+            13 => Some(Self::TooManyKeys),
+            14 => Some(Self::WaitTooLong),
+            15 => Some(Self::KeyboardBusy),
+            16 => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
     pub const fn from_decode(error: DecodeError) -> Self {
         match error {
             DecodeError::TooShort
@@ -131,6 +154,35 @@ mod tests {
             CommandError::UnsupportedCommand,
         ] {
             assert_eq!(ErrorCode::from(error), ErrorCode::BadCommand);
+        }
+    }
+
+    #[test]
+    fn wire_error_bytes_decode_only_defined_ids() {
+        let defined = [
+            ErrorCode::BadFrame,
+            ErrorCode::BadCommand,
+            ErrorCode::UnsupportedAscii,
+            ErrorCode::HidWrite,
+            ErrorCode::Transport,
+            ErrorCode::FrameTooLong,
+            ErrorCode::UnsupportedVersion,
+            ErrorCode::UnsupportedFlags,
+            ErrorCode::InvalidSequence,
+            ErrorCode::SequenceConflict,
+            ErrorCode::BatchState,
+            ErrorCode::BatchCapacity,
+            ErrorCode::TooManyKeys,
+            ErrorCode::WaitTooLong,
+            ErrorCode::KeyboardBusy,
+            ErrorCode::Cancelled,
+        ];
+
+        for error in defined {
+            assert_eq!(ErrorCode::from_byte(error as u8), Some(error));
+        }
+        for unknown in [0, 17, u8::MAX] {
+            assert_eq!(ErrorCode::from_byte(unknown), None);
         }
     }
 }
