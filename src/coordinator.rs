@@ -102,6 +102,7 @@ pub struct CachedResponse {
     sequence: u16,
     command_type: CommandType,
     payload: Vec<u8, 16>,
+    runtime_session: u32,
 }
 
 impl CachedResponse {
@@ -112,6 +113,7 @@ impl CachedResponse {
             sequence,
             command_type: CommandType::Ack,
             payload: Vec::new(),
+            runtime_session: 0,
         }
     }
 
@@ -125,6 +127,7 @@ impl CachedResponse {
             sequence,
             command_type: CommandType::Nack,
             payload,
+            runtime_session: 0,
         }
     }
 
@@ -142,6 +145,7 @@ impl CachedResponse {
             sequence,
             command_type: CommandType::Busy,
             payload,
+            runtime_session: 0,
         }
     }
 
@@ -156,6 +160,7 @@ impl CachedResponse {
             sequence,
             command_type: CommandType::Status,
             payload: owned,
+            runtime_session: 0,
         })
     }
 
@@ -177,6 +182,17 @@ impl CachedResponse {
     /// Returns the bounded response payload.
     pub fn payload(&self) -> &[u8] {
         self.payload.as_slice()
+    }
+
+    /// Attaches the firmware runtime session that produced this queued response.
+    pub const fn with_runtime_session(mut self, runtime_session: u32) -> Self {
+        self.runtime_session = runtime_session;
+        self
+    }
+
+    /// Returns the firmware runtime session attached before queueing.
+    pub const fn runtime_session(&self) -> u32 {
+        self.runtime_session
     }
 }
 
@@ -255,6 +271,7 @@ pub struct OwnedRequest {
     request_kind: RequestKind,
     completion_token: Option<CompletionToken>,
     body: OwnedRequestBody,
+    runtime_session: u32,
 }
 
 impl OwnedRequest {
@@ -274,6 +291,7 @@ impl OwnedRequest {
             request_kind,
             completion_token: None,
             body: OwnedRequestBody::Raw(payload),
+            runtime_session: 0,
         })
     }
 
@@ -320,6 +338,17 @@ impl OwnedRequest {
     /// Consumes the request and returns its owned command or batch marker.
     pub fn into_body(self) -> OwnedRequestBody {
         self.body
+    }
+
+    /// Attaches the receiver-side runtime session used for stale queue rejection.
+    pub const fn with_runtime_session(mut self, runtime_session: u32) -> Self {
+        self.runtime_session = runtime_session;
+        self
+    }
+
+    /// Returns the receiver-side runtime session stamp.
+    pub const fn runtime_session(&self) -> u32 {
+        self.runtime_session
     }
 }
 
@@ -481,7 +510,16 @@ impl Coordinator {
     }
 
     /// Applies dispatcher-side admission to a receiver-owned raw request.
-    pub fn admit_prepared(&mut self, mut request: OwnedRequest) -> Admission {
+    pub fn admit_prepared(&mut self, request: OwnedRequest) -> Admission {
+        self.admit_prepared_with_external_busy(request, false)
+    }
+
+    /// Applies admission while an external emergency release may own execution.
+    pub fn admit_prepared_with_external_busy(
+        &mut self,
+        mut request: OwnedRequest,
+        external_busy: bool,
+    ) -> Admission {
         if request.request_kind == RequestKind::ResponseExpected
             && let Some(entry) = self
                 .cache
@@ -515,6 +553,14 @@ impl Coordinator {
         };
         request.body = decoded;
         let request_class = classify_request(&request.body);
+        if external_busy
+            && matches!(
+                request_class,
+                RequestClass::BatchBegin | RequestClass::BatchEnd | RequestClass::Mutating
+            )
+        {
+            return Admission::Busy(BusyReason::ExecutorOccupied);
+        }
 
         match request_class {
             RequestClass::BatchBegin => self.admit_batch_begin(request),
@@ -757,6 +803,9 @@ impl Default for Coordinator {
 pub struct RuntimeModel {
     coordinator: Coordinator,
     input_held: bool,
+    pending_stops: Vec<CompletionToken, RESPONSE_CACHE_SIZE>,
+    emergency_in_flight: bool,
+    session_generation: u32,
 }
 
 /// Observable work emitted by [`RuntimeModel`].
@@ -768,8 +817,12 @@ pub enum ModelEvent {
     Respond(CachedResponse),
     /// Cancel the active executor and release both HID interfaces before ACKing STOP_ALL.
     CancelAndRelease { stop_sequence: u16 },
+    /// Publish another cancellation while the existing emergency release remains authoritative.
+    CancelOnly { stop_sequence: u16 },
     /// Cancel, release, and invalidate the current controller session.
     CancelReleaseAndResetSession,
+    /// Invalidate the session while the already queued release remains authoritative.
+    CancelAndResetSession,
 }
 
 /// Runtime conditions that require the same no-response emergency release path.
@@ -789,7 +842,29 @@ impl RuntimeModel {
         Self {
             coordinator: Coordinator::new(),
             input_held: false,
+            pending_stops: Vec::new(),
+            emergency_in_flight: false,
+            session_generation: 1,
         }
+    }
+
+    /// Applies a queued request only when its receiver-side session stamp is current.
+    pub fn accept_from_session(
+        &mut self,
+        session_generation: u32,
+        frame: Frame<'_>,
+    ) -> Option<ModelEvent> {
+        (session_generation == self.session_generation).then(|| self.accept(frame))
+    }
+
+    /// Returns the generation attached to newly received work and responses.
+    pub const fn session_generation(&self) -> u32 {
+        self.session_generation
+    }
+
+    /// Reports whether a queued response belongs to the current runtime session.
+    pub const fn response_is_current(&self, response: &CachedResponse) -> bool {
+        response.runtime_session() == self.session_generation
     }
 
     /// Applies coordinator admission and exposes the dispatch action relevant to runtime ordering.
@@ -801,9 +876,20 @@ impl RuntimeModel {
             | Admission::Collect(request)
             | Admission::Bypass(request)
             | Admission::NoResponse(request) => ModelEvent::Start(request.sequence()),
-            Admission::Stop(request) => ModelEvent::CancelAndRelease {
-                stop_sequence: request.sequence(),
-            },
+            Admission::Stop(request) => {
+                let stop_sequence = request.sequence();
+                let token = request
+                    .completion_token()
+                    .expect("STOP_ALL admission must carry a completion token");
+                let pushed = self.pending_stops.push(token);
+                debug_assert!(pushed.is_ok());
+                if self.emergency_in_flight {
+                    ModelEvent::CancelOnly { stop_sequence }
+                } else {
+                    self.emergency_in_flight = true;
+                    ModelEvent::CancelAndRelease { stop_sequence }
+                }
+            }
             Admission::Replay(response) | Admission::Immediate(response) => {
                 ModelEvent::Respond(response)
             }
@@ -817,7 +903,22 @@ impl RuntimeModel {
     }
 
     /// Completes a cancelled executor before completing the active STOP_ALL request.
-    pub fn complete_cancelled(&mut self, sequence: u16) -> Vec<CachedResponse, 2> {
+    pub fn complete_cancelled(
+        &mut self,
+        sequence: u16,
+    ) -> Vec<CachedResponse, { RESPONSE_CACHE_SIZE + 1 }> {
+        let mut responses = Vec::new();
+        let cancelled = self.complete_executor_cancelled(sequence);
+        let extended = responses.extend_from_slice(cancelled.as_slice());
+        debug_assert!(extended.is_ok());
+        let completed = self.complete_emergency();
+        let extended = responses.extend_from_slice(completed.as_slice());
+        debug_assert!(extended.is_ok());
+        responses
+    }
+
+    /// Completes only the cancelled ordinary or batch owner.
+    pub fn complete_executor_cancelled(&mut self, sequence: u16) -> Vec<CachedResponse, 1> {
         let mut responses = Vec::new();
         if let Some(token) = self.active_token(sequence) {
             let response = token.nack(ErrorCode::Cancelled);
@@ -826,16 +927,35 @@ impl RuntimeModel {
             let pushed = responses.push(response);
             debug_assert!(pushed.is_ok());
         }
-
-        if let Some(token) = self.active_stop_token() {
-            let response = token.ack();
-            let completed = self.coordinator.complete(token, response.clone());
-            debug_assert_eq!(completed, Ok(()));
-            let pushed = responses.push(response);
-            debug_assert!(pushed.is_ok());
-        }
         self.input_held = false;
         responses
+    }
+
+    /// Completes the one coalesced release and ACKs every still-valid pending STOP_ALL.
+    pub fn complete_emergency(&mut self) -> Vec<CachedResponse, RESPONSE_CACHE_SIZE> {
+        let mut responses = Vec::new();
+        let pending_stops = core::mem::take(&mut self.pending_stops);
+        for token in pending_stops {
+            let response = token.ack();
+            let completed = self.coordinator.complete(token, response.clone());
+            if completed.is_ok() {
+                let pushed = responses.push(response);
+                debug_assert!(pushed.is_ok());
+            }
+        }
+        self.emergency_in_flight = false;
+        self.input_held = false;
+        responses
+    }
+
+    /// Number of STOP_ALL completions waiting for the coalesced release result.
+    pub fn pending_stop_count(&self) -> usize {
+        self.pending_stops.len()
+    }
+
+    /// Reports whether an emergency release is queued or executing.
+    pub const fn emergency_in_flight(&self) -> bool {
+        self.emergency_in_flight
     }
 
     /// Opens a v2 batch and retains its replayable ACK in the coordinator cache.
@@ -863,8 +983,15 @@ impl RuntimeModel {
     /// Applies a no-response emergency transition and invalidates the current session cache.
     pub fn safety_event(&mut self, _event: SafetyEvent) -> ModelEvent {
         self.input_held = false;
+        self.pending_stops.clear();
         self.coordinator.clear_session();
-        ModelEvent::CancelReleaseAndResetSession
+        self.session_generation = advance_session_generation(self.session_generation);
+        if self.emergency_in_flight {
+            ModelEvent::CancelAndResetSession
+        } else {
+            self.emergency_in_flight = true;
+            ModelEvent::CancelReleaseAndResetSession
+        }
     }
 
     /// Reports whether a batch is collecting or executing.
@@ -884,23 +1011,12 @@ impl RuntimeModel {
             .find(|entry| entry.sequence == sequence && entry.state == CacheState::Active)
             .map(|entry| entry.token)
     }
+}
 
-    fn active_stop_token(&self) -> Option<CompletionToken> {
-        self.coordinator
-            .cache
-            .iter()
-            .find(|entry| {
-                let stop = Frame {
-                    version: entry.token.version(),
-                    flags: 0,
-                    sequence: entry.sequence,
-                    command_type: CommandType::StopAll,
-                    payload: &[],
-                };
-                entry.state == CacheState::Active && entry.fingerprint == fingerprint(&stop)
-            })
-            .map(|entry| entry.token)
-    }
+/// Advances a nonzero runtime session generation, skipping zero on wrap.
+pub const fn advance_session_generation(current: u32) -> u32 {
+    let next = current.wrapping_add(1);
+    if next == 0 { 1 } else { next }
 }
 
 impl Default for RuntimeModel {
@@ -971,6 +1087,7 @@ mod tests {
             sequence: token.sequence(),
             command_type,
             payload: owned_payload,
+            runtime_session: 0,
         }
     }
 
@@ -1006,6 +1123,7 @@ mod tests {
             request_kind: validate_request(frame).unwrap(),
             completion_token: None,
             body: own_request_body(frame).unwrap(),
+            runtime_session: 0,
         }
     }
 
@@ -1033,6 +1151,135 @@ mod tests {
             responses.as_slice(),
             &[nack(10, ErrorCode::Cancelled), ack(11)]
         );
+    }
+
+    #[test]
+    fn repeated_stops_share_one_release_and_ack_after_cancelled_work() {
+        let mut model = RuntimeModel::new();
+        assert_eq!(
+            model.accept(request(2, 30, CommandType::WaitMs, &[0, 0, 0x13, 0x88])),
+            ModelEvent::Start(30)
+        );
+        assert_eq!(
+            model.accept(request(2, 31, CommandType::StopAll, &[])),
+            ModelEvent::CancelAndRelease { stop_sequence: 31 }
+        );
+        assert_eq!(
+            model.accept(request(2, 32, CommandType::StopAll, &[])),
+            ModelEvent::CancelOnly { stop_sequence: 32 }
+        );
+        assert_eq!(model.pending_stop_count(), 2);
+        assert!(model.emergency_in_flight());
+
+        assert_eq!(
+            model.complete_executor_cancelled(30).as_slice(),
+            &[nack(30, ErrorCode::Cancelled)]
+        );
+        assert_eq!(model.complete_emergency().as_slice(), &[ack(31), ack(32)]);
+        assert_eq!(model.pending_stop_count(), 0);
+        assert!(!model.emergency_in_flight());
+    }
+
+    #[test]
+    fn safety_during_stop_invalidates_stop_without_queueing_another_release() {
+        let mut model = RuntimeModel::new();
+        assert_eq!(
+            model.accept(request(2, 40, CommandType::WaitMs, &[0, 0, 0, 1])),
+            ModelEvent::Start(40)
+        );
+        assert_eq!(
+            model.accept(request(2, 41, CommandType::StopAll, &[])),
+            ModelEvent::CancelAndRelease { stop_sequence: 41 }
+        );
+
+        assert_eq!(
+            model.safety_event(SafetyEvent::DtrLost),
+            ModelEvent::CancelAndResetSession
+        );
+        assert_eq!(model.pending_stop_count(), 0);
+        assert!(model.emergency_in_flight());
+        assert!(model.complete_emergency().is_empty());
+        assert!(!model.emergency_in_flight());
+        assert!(!model.has_cached_sequence(40));
+        assert!(!model.has_cached_sequence(41));
+    }
+
+    #[test]
+    fn safety_reset_rejects_requests_stamped_by_the_old_session() {
+        let mut model = RuntimeModel::new();
+        let old_session = model.session_generation();
+
+        assert_eq!(
+            model.safety_event(SafetyEvent::UsbDisabled),
+            ModelEvent::CancelReleaseAndResetSession
+        );
+        let new_session = model.session_generation();
+        assert_ne!(old_session, new_session);
+        assert_eq!(
+            model.accept_from_session(
+                old_session,
+                request(2, 50, CommandType::WaitMs, &[0, 0, 0, 1])
+            ),
+            None
+        );
+
+        assert!(model.complete_emergency().is_empty());
+        assert_eq!(
+            model.accept_from_session(
+                new_session,
+                request(2, 51, CommandType::WaitMs, &[0, 0, 0, 1])
+            ),
+            Some(ModelEvent::Start(51))
+        );
+    }
+
+    #[test]
+    fn queued_requests_and_responses_retain_their_runtime_session_stamp() {
+        let owned = OwnedRequest::from_frame(&request(2, 60, CommandType::Ping, &[]))
+            .unwrap()
+            .with_runtime_session(7);
+        let response = CachedResponse::ack(2, 60).with_runtime_session(7);
+
+        assert_eq!(owned.runtime_session(), 7);
+        assert_eq!(response.runtime_session(), 7);
+    }
+
+    #[test]
+    fn safety_reset_marks_old_queued_responses_stale() {
+        let mut model = RuntimeModel::new();
+        let response = CachedResponse::ack(2, 61).with_runtime_session(model.session_generation());
+        assert!(model.response_is_current(&response));
+
+        assert_eq!(
+            model.safety_event(SafetyEvent::LeaseExpired),
+            ModelEvent::CancelReleaseAndResetSession
+        );
+
+        assert!(!model.response_is_current(&response));
+    }
+
+    #[test]
+    fn external_emergency_occupancy_refuses_mutation_without_hiding_it() {
+        let mut coordinator = Coordinator::new();
+        let mutation =
+            OwnedRequest::from_frame(&request(2, 70, CommandType::WaitMs, &[0, 0, 0, 1])).unwrap();
+
+        assert_eq!(
+            coordinator.admit_prepared_with_external_busy(mutation, true),
+            Admission::Busy(BusyReason::ExecutorOccupied)
+        );
+        assert!(!coordinator.has_cached_sequence(70));
+
+        let ping = OwnedRequest::from_frame(&request(2, 71, CommandType::Ping, &[])).unwrap();
+        assert!(matches!(
+            coordinator.admit_prepared_with_external_busy(ping, true),
+            Admission::Bypass(_)
+        ));
+        let stop = OwnedRequest::from_frame(&request(2, 72, CommandType::StopAll, &[])).unwrap();
+        assert!(matches!(
+            coordinator.admit_prepared_with_external_busy(stop, true),
+            Admission::Stop(_)
+        ));
     }
 
     #[test]

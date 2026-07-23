@@ -1,10 +1,11 @@
 //! Concurrent Embassy runtime for CDC admission, cancellable HID execution, and safety release.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::Timer;
 use embassy_usb::driver::EndpointError;
+use heapless::Vec;
 
 use crate::batch::{BatchCollector, BatchError};
 use crate::command_executor::{
@@ -12,7 +13,7 @@ use crate::command_executor::{
 };
 use crate::coordinator::{
     Admission, CachedResponse, CompletionToken, Coordinator, OwnedRequest, OwnedRequestBody,
-    SafetyEvent,
+    RESPONSE_CACHE_SIZE, SafetyEvent, advance_session_generation,
 };
 use crate::error::ErrorCode;
 use crate::firmware_config::{capability_payload, info_payload};
@@ -26,7 +27,7 @@ use crate::protocol::{
 use crate::response_writer::send_cached_response;
 use crate::safety::{CONTROL_LEASE_MS, CancellationGeneration, PARTIAL_FRAME_TIMEOUT_MS};
 use crate::static_resources::{
-    CANCEL, JOBS, LEASE_REFRESH, REQUESTS, RESPONSES, RESULTS, SAFETY_EVENTS,
+    CANCEL, JOBS, LEASE_REFRESH, REQUESTS, RESPONSE_RESET, RESPONSES, RESULTS, SAFETY_EVENTS,
 };
 use crate::usb_device::{
     CdcControl, CdcReceiver, CdcSender, KeyboardReader, KeyboardWriter, MouseWriter,
@@ -35,6 +36,7 @@ use crate::usb_device::{
 const BUSY_RETRY_MS: u16 = 10;
 
 static GUARDED_WORK: AtomicBool = AtomicBool::new(false);
+static SESSION_GENERATION: AtomicU32 = AtomicU32::new(1);
 
 /// One exclusive executor action. The single-slot channel prevents ordinary work queueing.
 // The batch stays inline intentionally: firmware has no allocator and the channel has capacity one.
@@ -49,9 +51,7 @@ pub enum ExecutionJob {
         batch: BatchCollector,
         baseline_generation: u32,
     },
-    Emergency {
-        stop: Option<CompletionToken>,
-    },
+    Emergency,
 }
 
 /// Executor completion returned to the dispatcher for token-bound cache mutation.
@@ -62,7 +62,6 @@ pub enum ExecutionResult {
         input_state: InputState,
     },
     Emergency {
-        stop: Option<CompletionToken>,
         input_state: InputState,
     },
 }
@@ -77,8 +76,17 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
         receiver.wait_connection().await;
         crate::set_led_mode(LedMode::Connected);
         let mut frame_len = 0usize;
+        let mut buffered_session = current_session_generation();
 
         loop {
+            let runtime_session = current_session_generation();
+            if runtime_session != buffered_session {
+                frame_len = 0;
+                buffered_session = runtime_session;
+            }
+            if !receiver.dtr() {
+                frame_len = 0;
+            }
             let read_result = if frame_len == 0 {
                 receiver.read_packet(&mut packet).await
             } else {
@@ -106,17 +114,20 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
                 Err(EndpointError::BufferOverflow) => {
                     crate::signal_led(LedSignal::Error);
                     frame_len = 0;
-                    RESPONSES
-                        .send(CachedResponse::nack(
-                            PROTOCOL_VERSION,
-                            0,
-                            ErrorCode::Transport,
-                        ))
-                        .await;
+                    if receiver.dtr() {
+                        queue_response_for_session(
+                            CachedResponse::nack(PROTOCOL_VERSION, 0, ErrorCode::Transport),
+                            runtime_session,
+                        );
+                    }
                     continue;
                 }
             };
 
+            if !receiver.dtr() {
+                frame_len = 0;
+                continue;
+            }
             if read_len == 0 {
                 continue;
             }
@@ -125,24 +136,25 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
                 let sequence = sequence_from_partial(&frame_buf[..frame_len]);
                 let version = response_version(&frame_buf[..frame_len]);
                 frame_len = 0;
-                RESPONSES
-                    .send(CachedResponse::nack(
-                        version,
-                        sequence,
-                        ErrorCode::FrameTooLong,
-                    ))
-                    .await;
+                queue_response_for_session(
+                    CachedResponse::nack(version, sequence, ErrorCode::FrameTooLong),
+                    runtime_session,
+                );
                 continue;
             }
 
             frame_buf[frame_len..frame_len + read_len].copy_from_slice(&packet[..read_len]);
             frame_len += read_len;
-            drain_frames(&mut frame_buf, &mut frame_len).await;
+            drain_frames(&mut frame_buf, &mut frame_len, runtime_session).await;
         }
     }
 }
 
-async fn drain_frames(frame_buf: &mut [u8; MAX_FRAME_SIZE], frame_len: &mut usize) {
+async fn drain_frames(
+    frame_buf: &mut [u8; MAX_FRAME_SIZE],
+    frame_len: &mut usize,
+    runtime_session: u32,
+) {
     while let Some(action) = next_frame_action(&frame_buf[..*frame_len]) {
         match action {
             FrameAction::NeedMore => break,
@@ -154,40 +166,37 @@ async fn drain_frames(frame_buf: &mut [u8; MAX_FRAME_SIZE], frame_len: &mut usiz
             } => {
                 crate::signal_led(LedSignal::Error);
                 let version = response_version(&frame_buf[..*frame_len]);
-                RESPONSES
-                    .send(CachedResponse::nack(
-                        version,
-                        sequence,
-                        ErrorCode::from_decode(error),
-                    ))
-                    .await;
+                queue_response_for_session(
+                    CachedResponse::nack(version, sequence, ErrorCode::from_decode(error)),
+                    runtime_session,
+                );
                 shift_left(frame_buf, frame_len, len);
             }
             FrameAction::Process(len) => {
                 match decode_frame(&frame_buf[..len]) {
                     Ok(frame) => match OwnedRequest::from_frame(&frame) {
                         Ok(request) => {
-                            REQUESTS.send(request).await;
+                            REQUESTS
+                                .send(request.with_runtime_session(runtime_session))
+                                .await;
                             crate::signal_led(LedSignal::Activity);
                         }
                         Err(error) => {
                             crate::signal_led(LedSignal::Error);
-                            RESPONSES
-                                .send(CachedResponse::nack(frame.version, frame.sequence, error))
-                                .await;
+                            queue_response_for_session(
+                                CachedResponse::nack(frame.version, frame.sequence, error),
+                                runtime_session,
+                            );
                         }
                     },
                     Err(error) => {
                         crate::signal_led(LedSignal::Error);
                         let version = response_version(&frame_buf[..len]);
                         let sequence = sequence_from_partial(&frame_buf[..len]);
-                        RESPONSES
-                            .send(CachedResponse::nack(
-                                version,
-                                sequence,
-                                ErrorCode::from_decode(error),
-                            ))
-                            .await;
+                        queue_response_for_session(
+                            CachedResponse::nack(version, sequence, ErrorCode::from_decode(error)),
+                            runtime_session,
+                        );
                     }
                 }
                 shift_left(frame_buf, frame_len, len);
@@ -202,6 +211,8 @@ pub async fn dispatcher_task() -> ! {
     let mut batch: Option<BatchCollector> = None;
     let mut input_state = InputState::new();
     let mut cancellation = CancellationGeneration::new();
+    let mut pending_stops = Vec::<CompletionToken, RESPONSE_CACHE_SIZE>::new();
+    let mut emergency_in_flight = false;
 
     loop {
         match select3(
@@ -212,10 +223,14 @@ pub async fn dispatcher_task() -> ! {
         .await
         {
             Either3::Third(request) => {
+                if request.runtime_session() != current_session_generation() {
+                    continue;
+                }
                 let version = request.version();
                 let sequence = request.sequence();
                 let command_type = request.command_type();
-                let admission = coordinator.admit_prepared(request);
+                let admission =
+                    coordinator.admit_prepared_with_external_busy(request, emergency_in_flight);
                 if version == PROTOCOL_VERSION
                     && !matches!(
                         &admission,
@@ -242,7 +257,7 @@ pub async fn dispatcher_task() -> ! {
                                     .expect("batch end must carry a completion token");
                                 let response = token.nack(ErrorCode::BatchState);
                                 let _ = coordinator.complete(token, response.clone());
-                                RESPONSES.send(response).await;
+                                queue_response(response);
                                 update_guarded(&coordinator, batch.as_ref(), input_state);
                                 continue;
                             };
@@ -280,15 +295,13 @@ pub async fn dispatcher_task() -> ! {
                             }
                         };
                         let _ = coordinator.complete(token, response.clone());
-                        RESPONSES.send(response).await;
+                        queue_response(response);
                         if result.is_err() {
-                            let generation = cancellation.cancel();
-                            CANCEL.signal(generation);
-                            JOBS.send(ExecutionJob::Emergency { stop: None }).await;
+                            schedule_emergency(&mut cancellation, &mut emergency_in_flight).await;
                         }
                     }
                     Admission::Bypass(request) => {
-                        complete_bypass(&mut coordinator, request).await;
+                        complete_bypass(&mut coordinator, request);
                     }
                     Admission::NoResponse(_) => {}
                     Admission::Stop(request) => {
@@ -296,33 +309,28 @@ pub async fn dispatcher_task() -> ! {
                         let stop = request
                             .completion_token()
                             .expect("STOP_ALL must carry a completion token");
-                        let generation = cancellation.cancel();
-                        CANCEL.signal(generation);
-                        JOBS.send(ExecutionJob::Emergency { stop: Some(stop) })
-                            .await;
+                        let pushed = pending_stops.push(stop);
+                        debug_assert!(pushed.is_ok());
+                        schedule_emergency(&mut cancellation, &mut emergency_in_flight).await;
                     }
                     Admission::Replay(response) => {
-                        RESPONSES.send(response).await;
+                        queue_response(response);
                     }
                     Admission::Immediate(response) => {
                         debug_assert_eq!(command_type, CommandType::BatchBegin);
                         batch = Some(BatchCollector::begin(input_state));
-                        RESPONSES.send(response).await;
+                        queue_response(response);
                     }
                     Admission::Busy(reason) => {
-                        RESPONSES
-                            .send(CachedResponse::busy(
-                                version,
-                                sequence,
-                                reason,
-                                BUSY_RETRY_MS,
-                            ))
-                            .await;
+                        queue_response(CachedResponse::busy(
+                            version,
+                            sequence,
+                            reason,
+                            BUSY_RETRY_MS,
+                        ));
                     }
                     Admission::Reject(error) => {
-                        RESPONSES
-                            .send(CachedResponse::nack(version, sequence, error))
-                            .await;
+                        queue_response(CachedResponse::nack(version, sequence, error));
                     }
                 }
             }
@@ -334,28 +342,32 @@ pub async fn dispatcher_task() -> ! {
                 } => {
                     input_state = next_state;
                     if coordinator.complete(token, response.clone()).is_ok() {
-                        RESPONSES.send(response).await;
+                        queue_response(response);
                     }
                 }
                 ExecutionResult::Emergency {
-                    stop,
                     input_state: next_state,
                 } => {
                     input_state = next_state;
-                    if let Some(token) = stop {
+                    emergency_in_flight = false;
+                    let stops = core::mem::take(&mut pending_stops);
+                    for token in stops {
                         let response = token.ack();
                         if coordinator.complete(token, response.clone()).is_ok() {
-                            RESPONSES.send(response).await;
+                            queue_response(response);
                         }
                     }
                 }
             },
             Either3::First(_event) => {
+                let runtime_session = advance_runtime_session();
+                RESPONSE_RESET.signal(runtime_session);
+                while REQUESTS.try_receive().is_ok() {}
+                while RESPONSES.try_receive().is_ok() {}
                 batch = None;
+                pending_stops.clear();
                 coordinator.clear_session();
-                let generation = cancellation.cancel();
-                CANCEL.signal(generation);
-                JOBS.send(ExecutionJob::Emergency { stop: None }).await;
+                schedule_emergency(&mut cancellation, &mut emergency_in_flight).await;
             }
         }
 
@@ -363,7 +375,7 @@ pub async fn dispatcher_task() -> ! {
     }
 }
 
-async fn complete_bypass(coordinator: &mut Coordinator, request: OwnedRequest) {
+fn complete_bypass(coordinator: &mut Coordinator, request: OwnedRequest) {
     let token = request
         .completion_token()
         .expect("response-bearing bypass must carry a completion token");
@@ -382,7 +394,7 @@ async fn complete_bypass(coordinator: &mut Coordinator, request: OwnedRequest) {
     };
     let completed = coordinator.complete(token, response.clone());
     debug_assert!(completed.is_ok());
-    RESPONSES.send(response).await;
+    queue_response(response);
 }
 
 #[embassy_executor::task]
@@ -451,10 +463,10 @@ pub async fn executor_task(mut keyboard: KeyboardWriter, mut mouse: MouseWriter)
                     })
                     .await;
             }
-            ExecutionJob::Emergency { stop } => {
+            ExecutionJob::Emergency => {
                 let _ = reset_inputs(&mut keyboard, &mut mouse, &mut input_state).await;
                 RESULTS
-                    .send(ExecutionResult::Emergency { stop, input_state })
+                    .send(ExecutionResult::Emergency { input_state })
                     .await;
             }
         }
@@ -577,19 +589,62 @@ fn execution_response(
     }
 }
 
+async fn schedule_emergency(
+    cancellation: &mut CancellationGeneration,
+    emergency_in_flight: &mut bool,
+) {
+    let generation = cancellation.cancel();
+    CANCEL.signal(generation);
+    if !*emergency_in_flight {
+        *emergency_in_flight = true;
+        JOBS.send(ExecutionJob::Emergency).await;
+    }
+}
+
+fn current_session_generation() -> u32 {
+    SESSION_GENERATION.load(Ordering::Acquire)
+}
+
+fn advance_runtime_session() -> u32 {
+    let next = advance_session_generation(current_session_generation());
+    SESSION_GENERATION.store(next, Ordering::Release);
+    next
+}
+
+fn queue_response(response: CachedResponse) {
+    queue_response_for_session(response, current_session_generation());
+}
+
+fn queue_response_for_session(response: CachedResponse, runtime_session: u32) {
+    let _ = RESPONSES.try_send(response.with_runtime_session(runtime_session));
+}
+
 #[embassy_executor::task]
 pub async fn response_task(mut sender: CdcSender) -> ! {
     loop {
         sender.wait_connection().await;
         loop {
-            let response = RESPONSES.receive().await;
-            match send_cached_response(&mut sender, &response).await {
-                Ok(()) => {}
-                Err(EndpointError::Disabled) => {
+            let response = match select(RESPONSE_RESET.wait(), RESPONSES.receive()).await {
+                Either::First(_) => continue,
+                Either::Second(response) => response,
+            };
+            if response.runtime_session() != current_session_generation() || !sender.dtr() {
+                continue;
+            }
+
+            match select(
+                RESPONSE_RESET.wait(),
+                send_cached_response(&mut sender, &response),
+            )
+            .await
+            {
+                Either::First(_) => continue,
+                Either::Second(Ok(())) => {}
+                Either::Second(Err(EndpointError::Disabled)) => {
                     SAFETY_EVENTS.send(SafetyEvent::UsbDisabled).await;
                     break;
                 }
-                Err(EndpointError::BufferOverflow) => {}
+                Either::Second(Err(EndpointError::BufferOverflow)) => {}
             }
         }
     }
@@ -602,6 +657,7 @@ pub async fn cdc_control_task(control: CdcControl) -> ! {
         control.control_changed().await;
         let dtr = control.dtr();
         if previous_dtr && !dtr {
+            RESPONSE_RESET.signal(current_session_generation());
             SAFETY_EVENTS.send(SafetyEvent::DtrLost).await;
         }
         previous_dtr = dtr;
