@@ -72,12 +72,22 @@ impl KeyboardState {
     }
 
     pub fn tap_plan(&self, stroke: KeyStroke) -> Result<KeyboardPulse, InputError> {
-        let requested_part_is_held = self.modifiers & stroke.modifier != 0
-            || (stroke.keycode != 0 && self.key_position(stroke.keycode).is_some());
+        let requested_part_is_held = if stroke.keycode == 0 {
+            self.modifiers & stroke.modifier != 0
+        } else {
+            self.key_position(stroke.keycode).is_some()
+        };
 
         if requested_part_is_held {
             let mut released = *self;
-            released.key_up(stroke);
+            released.key_up(KeyStroke {
+                modifier: if stroke.keycode == 0 {
+                    stroke.modifier
+                } else {
+                    0
+                },
+                keycode: stroke.keycode,
+            });
             let mut pressed = released;
             pressed.key_down(stroke)?;
             Ok(KeyboardPulse::ReleasePressRestore {
@@ -354,12 +364,53 @@ mod tests {
     }
 
     #[test]
-    fn tapping_an_already_held_key_and_modifier_pulses_then_restores_exact_state() {
+    fn tapping_new_key_with_held_modifier_does_not_release_modifier() {
+        let mut keyboard = KeyboardState::new();
+        keyboard.key_down(stroke(0x02, 0x1A)).unwrap();
+        let original = keyboard;
+        let requested = stroke(0x02, 0x07);
+        let mut pressed = original;
+        pressed.key_down(requested).unwrap();
+
+        assert_eq!(
+            keyboard.tap_plan(requested),
+            Ok(KeyboardPulse::PressRestore {
+                pressed,
+                restore: original,
+            })
+        );
+        assert_eq!(keyboard, original);
+    }
+
+    #[test]
+    fn tapping_held_key_preserves_held_modifier_during_release() {
         let mut keyboard = KeyboardState::new();
         let requested = stroke(0x02, 0x1A);
-        keyboard.key_down(stroke(0x03, 0x1A)).unwrap();
-        keyboard.key_down(stroke(0, 0x07)).unwrap();
+        keyboard.key_down(requested).unwrap();
         let original = keyboard;
+
+        let mut released = original;
+        released.key_up(stroke(0, requested.keycode));
+        let mut pressed = released;
+        pressed.key_down(requested).unwrap();
+
+        assert_eq!(
+            keyboard.tap_plan(requested),
+            Ok(KeyboardPulse::ReleasePressRestore {
+                released,
+                pressed,
+                restore: original,
+            })
+        );
+        assert_eq!(keyboard, original);
+    }
+
+    #[test]
+    fn tapping_held_modifier_only_stroke_releases_and_restores_it() {
+        let mut keyboard = KeyboardState::new();
+        keyboard.key_down(stroke(0x02, 0x1A)).unwrap();
+        let original = keyboard;
+        let requested = stroke(0x02, 0);
 
         let mut released = original;
         released.key_up(requested);
@@ -370,6 +421,25 @@ mod tests {
             keyboard.tap_plan(requested),
             Ok(KeyboardPulse::ReleasePressRestore {
                 released,
+                pressed,
+                restore: original,
+            })
+        );
+        assert_eq!(keyboard, original);
+    }
+
+    #[test]
+    fn tapping_unheld_modifier_only_stroke_presses_then_restores_it() {
+        let mut keyboard = KeyboardState::new();
+        keyboard.key_down(stroke(0, 0x1A)).unwrap();
+        let original = keyboard;
+        let requested = stroke(0x02, 0);
+        let mut pressed = original;
+        pressed.key_down(requested).unwrap();
+
+        assert_eq!(
+            keyboard.tap_plan(requested),
+            Ok(KeyboardPulse::PressRestore {
                 pressed,
                 restore: original,
             })
