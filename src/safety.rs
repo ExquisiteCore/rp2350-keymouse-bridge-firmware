@@ -223,6 +223,44 @@ impl Default for CancellationGeneration {
     }
 }
 
+/// Sticky per-operation observation of a cancellation generation.
+///
+/// A queued value equal to the baseline is stale and does not cancel. Once a
+/// changed generation is observed, later stale values cannot clear it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CancellationObservation {
+    baseline: u32,
+    cancelled: bool,
+}
+
+impl CancellationObservation {
+    #[must_use]
+    pub const fn new(baseline: u32) -> Self {
+        Self {
+            baseline,
+            cancelled: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn baseline(&self) -> u32 {
+        self.baseline
+    }
+
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// Observes one published generation and returns the sticky state.
+    pub fn observe(&mut self, generation: u32) -> bool {
+        if generation != self.baseline {
+            self.cancelled = true;
+        }
+        self.cancelled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +477,25 @@ mod tests {
         generation.cancel();
         assert!(generation.changed_since(snapshot));
         assert_ne!(generation.current(), 0);
+    }
+
+    #[test]
+    fn cancellation_observation_ignores_stale_baseline_values() {
+        let mut observation = CancellationObservation::new(7);
+
+        assert_eq!(observation.baseline(), 7);
+        assert!(!observation.is_cancelled());
+        assert!(!observation.observe(7));
+        assert!(!observation.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_observation_is_sticky_after_a_changed_generation() {
+        let mut observation = CancellationObservation::new(7);
+
+        assert!(observation.observe(8));
+        assert!(observation.is_cancelled());
+        assert!(observation.observe(7));
+        assert!(observation.is_cancelled());
     }
 }

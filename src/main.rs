@@ -10,13 +10,21 @@
 
 mod command_executor;
 mod commands;
+// These shared modules expose protocol/runtime APIs that the Task 7 binary
+// coordinator will consume. The temporary serial loop uses only a subset.
+#[allow(dead_code)]
 mod error;
 mod firmware_config;
+#[allow(dead_code)]
 mod frame_stream;
 mod hid_report;
+#[allow(dead_code)]
+mod input_state;
 mod led;
+#[allow(dead_code)]
 mod protocol;
 mod response_writer;
+#[allow(dead_code)]
 mod safety;
 mod static_resources;
 mod usb_device;

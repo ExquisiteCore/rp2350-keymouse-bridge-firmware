@@ -133,6 +133,31 @@ pub enum KeyboardPulse {
     },
 }
 
+impl KeyboardPulse {
+    pub const fn released(&self) -> Option<&KeyboardState> {
+        match self {
+            Self::PressRestore { .. } => None,
+            Self::ReleasePressRestore { released, .. } => Some(released),
+        }
+    }
+
+    pub const fn pressed(&self) -> &KeyboardState {
+        match self {
+            Self::PressRestore { pressed, .. } | Self::ReleasePressRestore { pressed, .. } => {
+                pressed
+            }
+        }
+    }
+
+    pub const fn restore(&self) -> &KeyboardState {
+        match self {
+            Self::PressRestore { restore, .. } | Self::ReleasePressRestore { restore, .. } => {
+                restore
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MouseState {
     buttons: u8,
@@ -201,6 +226,67 @@ pub enum MousePulse {
         pressed: u8,
         restore: u8,
     },
+}
+
+impl MousePulse {
+    pub const fn released(&self) -> Option<MouseState> {
+        match self {
+            Self::PressRestore { .. } => None,
+            Self::ReleasePressRestore { released, .. } => Some(MouseState::from_buttons(*released)),
+        }
+    }
+
+    pub const fn pressed(&self) -> MouseState {
+        match self {
+            Self::PressRestore { pressed, .. } | Self::ReleasePressRestore { pressed, .. } => {
+                MouseState::from_buttons(*pressed)
+            }
+        }
+    }
+
+    pub const fn restore(&self) -> MouseState {
+        match self {
+            Self::PressRestore { restore, .. } | Self::ReleasePressRestore { restore, .. } => {
+                MouseState::from_buttons(*restore)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelativeMovementSteps {
+    remaining_x: i16,
+    remaining_y: i16,
+}
+
+impl RelativeMovementSteps {
+    pub const fn new(dx: i16, dy: i16) -> Self {
+        Self {
+            remaining_x: dx,
+            remaining_y: dy,
+        }
+    }
+}
+
+impl Iterator for RelativeMovementSteps {
+    type Item = (i8, i8);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_x == 0 && self.remaining_y == 0 {
+            return None;
+        }
+
+        let step_x = self
+            .remaining_x
+            .clamp(-i16::from(i8::MAX), i16::from(i8::MAX)) as i8;
+        let step_y = self
+            .remaining_y
+            .clamp(-i16::from(i8::MAX), i16::from(i8::MAX)) as i8;
+        self.remaining_x -= i16::from(step_x);
+        self.remaining_y -= i16::from(step_y);
+
+        Some((step_x, step_y))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -468,6 +554,52 @@ mod tests {
     }
 
     #[test]
+    fn tapping_d_does_not_release_held_w_and_shift() {
+        let mut state = InputState::new();
+        state
+            .keyboard
+            .key_down(KeyStroke {
+                modifier: 0,
+                keycode: 0x1A,
+            })
+            .unwrap();
+        state
+            .keyboard
+            .key_down(KeyStroke {
+                modifier: 0x02,
+                keycode: 0,
+            })
+            .unwrap();
+
+        let plan = state
+            .keyboard
+            .tap_plan(KeyStroke {
+                modifier: 0,
+                keycode: 0x07,
+            })
+            .unwrap();
+
+        assert_eq!(plan.restore().modifiers(), 0x02);
+        assert_eq!(plan.restore().keycodes(), &[0x1A]);
+    }
+
+    #[test]
+    fn held_key_tap_accessors_expose_release_press_restore_order() {
+        let mut keyboard = KeyboardState::new();
+        keyboard.key_down(stroke(0x02, 0x1A)).unwrap();
+        keyboard.key_down(stroke(0, 0x07)).unwrap();
+
+        let plan = keyboard.tap_plan(stroke(0, 0x07)).unwrap();
+
+        let released = plan.released().expect("held key needs a release phase");
+        assert_eq!(released.modifiers(), 0x02);
+        assert_eq!(released.keycodes(), &[0x1A]);
+        assert_eq!(plan.pressed().modifiers(), 0x02);
+        assert_eq!(plan.pressed().keycodes(), &[0x1A, 0x07]);
+        assert_eq!(plan.restore(), &keyboard);
+    }
+
+    #[test]
     fn tap_at_capacity_accepts_held_keys_and_modifier_only_strokes() {
         let keyboard = six_key_keyboard();
 
@@ -552,6 +684,17 @@ mod tests {
     }
 
     #[test]
+    fn held_mouse_click_accessors_expose_release_press_restore_order() {
+        let mouse = MouseState::from_buttons(0x03);
+
+        let plan = mouse.click_plan(MouseButton::Left);
+
+        assert_eq!(plan.released(), Some(MouseState::from_buttons(0x02)));
+        assert_eq!(plan.pressed(), MouseState::from_buttons(0x03));
+        assert_eq!(plan.restore(), MouseState::from_buttons(0x03));
+    }
+
+    #[test]
     fn ascii_validation_is_transactional_for_unsupported_bytes() {
         let mut out = Vec::<KeyStroke, 240>::new();
         out.push(stroke(0, 0x2C)).unwrap();
@@ -562,6 +705,17 @@ mod tests {
             Err(InputError::UnsupportedAscii(0x7F))
         );
         assert_eq!(out, before);
+    }
+
+    #[test]
+    fn ascii_prevalidation_rejects_control_bytes_before_producing_strokes() {
+        let mut out = Vec::<KeyStroke, MAX_ASCII_STROKES>::new();
+
+        assert_eq!(
+            ascii_strokes(b"ok\x01", false, &mut out),
+            Err(InputError::UnsupportedAscii(1))
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -629,5 +783,19 @@ mod tests {
         assert!(state.is_idle());
         assert!(state.keyboard.is_idle());
         assert!(state.mouse.is_idle());
+    }
+
+    #[test]
+    fn relative_movement_steps_preserve_full_signed_displacement() {
+        let steps = RelativeMovementSteps::new(300, -300).collect::<std::vec::Vec<_>>();
+
+        assert_eq!(steps, [(127, -127), (127, -127), (46, -46)]);
+        assert_eq!(steps.iter().map(|(x, _)| i16::from(*x)).sum::<i16>(), 300);
+        assert_eq!(steps.iter().map(|(_, y)| i16::from(*y)).sum::<i16>(), -300);
+    }
+
+    #[test]
+    fn zero_relative_movement_has_no_reports() {
+        assert_eq!(RelativeMovementSteps::new(0, 0).next(), None);
     }
 }

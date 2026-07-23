@@ -2,6 +2,9 @@
 
 use crate::protocol::MAX_PAYLOAD_SIZE;
 pub use crate::protocol::PROTOCOL_VERSION;
+// Task 7 consumes these from the binary runtime. Keep the cross-target API in
+// place without making the temporary single-loop firmware fail `-D warnings`.
+#[allow(unused_imports)]
 pub use crate::safety::{CONTROL_LEASE_MS, HEARTBEAT_INTERVAL_MS, PARTIAL_FRAME_TIMEOUT_MS};
 
 pub const USB_VENDOR_ID: u16 = 0xCAFE;

@@ -1,6 +1,7 @@
 //! 固件响应给主机的错误码。
 
 use crate::commands::CommandError;
+use crate::input_state::InputError;
 use crate::protocol::{DecodeError, RequestError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +75,11 @@ impl ErrorCode {
             | CommandError::UnsupportedCommand => Self::BadCommand,
         }
     }
+
+    /// Returns whether execution must attempt to release all HID state.
+    pub const fn requires_best_effort_release(self) -> bool {
+        matches!(self, Self::HidWrite | Self::Cancelled)
+    }
 }
 
 impl From<RequestError> for ErrorCode {
@@ -88,10 +94,23 @@ impl From<CommandError> for ErrorCode {
     }
 }
 
+impl From<InputError> for ErrorCode {
+    fn from(error: InputError) -> Self {
+        match error {
+            InputError::TooManyKeys => Self::TooManyKeys,
+            InputError::UnsupportedAscii(_) => Self::UnsupportedAscii,
+            // ASCII stroke storage is bounded by the protocol payload limit,
+            // so overflow is represented by the existing frame-capacity code.
+            InputError::TooManyStrokes => Self::FrameTooLong,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::CommandError;
+    use crate::input_state::InputError;
     use crate::protocol::RequestError;
 
     #[test]
@@ -155,6 +174,29 @@ mod tests {
         ] {
             assert_eq!(ErrorCode::from(error), ErrorCode::BadCommand);
         }
+    }
+
+    #[test]
+    fn input_errors_map_to_stable_protocol_errors() {
+        assert_eq!(
+            ErrorCode::from(InputError::TooManyKeys),
+            ErrorCode::TooManyKeys
+        );
+        assert_eq!(
+            ErrorCode::from(InputError::UnsupportedAscii(0x01)),
+            ErrorCode::UnsupportedAscii
+        );
+        assert_eq!(
+            ErrorCode::from(InputError::TooManyStrokes),
+            ErrorCode::FrameTooLong
+        );
+    }
+
+    #[test]
+    fn interrupted_hid_execution_requires_best_effort_release() {
+        assert!(ErrorCode::Cancelled.requires_best_effort_release());
+        assert!(ErrorCode::HidWrite.requires_best_effort_release());
+        assert!(!ErrorCode::BadCommand.requires_best_effort_release());
     }
 
     #[test]

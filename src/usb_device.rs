@@ -1,5 +1,7 @@
 //! USB 复合设备配置和固件内使用的 USB 类型别名。
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_usb::Config;
@@ -12,11 +14,27 @@ use usbd_hid::descriptor::{KeyboardReport, MouseReport, SerializedDescriptor};
 use crate::firmware_config::{USB_PRODUCT_ID, USB_VENDOR_ID};
 use crate::usb_identity::{USB_MANUFACTURER, USB_PRODUCT, USB_SERIAL_NUMBER};
 
+static CAPS_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
+
 pub type UsbDriver = Driver<'static, USB>;
 pub type CdcClass = CdcAcmClass<'static, UsbDriver>;
 pub type KeyboardWriter = HidWriter<'static, UsbDriver, 8>;
 pub type MouseWriter = HidWriter<'static, UsbDriver, 8>;
 pub type UsbHidState = HidState<'static>;
+
+/// Returns the most recently observed host Caps Lock LED state.
+pub fn caps_lock_enabled() -> bool {
+    CAPS_LOCK_ENABLED.load(Ordering::Acquire)
+}
+
+/// Publishes the host Caps Lock LED state for ASCII mapping.
+///
+/// Task 8's keyboard OUT report handler will call this setter. Release/Acquire
+/// ordering makes that handler's publication visible to command execution.
+#[allow(dead_code)]
+pub fn set_caps_lock_enabled(enabled: bool) {
+    CAPS_LOCK_ENABLED.store(enabled, Ordering::Release);
+}
 
 pub fn usb_config() -> Config<'static> {
     let mut config = Config::new(USB_VENDOR_ID, USB_PRODUCT_ID);
