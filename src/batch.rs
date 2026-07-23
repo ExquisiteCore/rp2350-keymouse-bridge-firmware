@@ -191,16 +191,23 @@ mod tests {
         for _ in 0..BATCH_MAX_COMMANDS {
             batch.push(OwnedCommand::WaitMs(1)).unwrap();
         }
+        let commands_before = batch.commands.clone();
+        let payload_before = batch.payload_bytes();
+        let shadow_before = *batch.shadow();
+
         assert_eq!(
             batch.push(OwnedCommand::WaitMs(1)),
             Err(BatchError::Capacity)
         );
-        assert_batch_state(
-            &batch,
-            BATCH_MAX_COMMANDS,
-            BATCH_MAX_COMMANDS * 4,
-            InputState::new(),
+        assert_eq!(
+            batch.push(OwnedCommand::KeyDown(stroke(0, 0x1A))),
+            Err(BatchError::Capacity)
         );
+
+        assert_eq!(batch.commands(), commands_before.as_slice());
+        assert_batch_state(&batch, BATCH_MAX_COMMANDS, payload_before, shadow_before);
+        assert_eq!(payload_before, BATCH_MAX_COMMANDS * 4);
+        assert!(batch.shadow().keyboard.is_idle());
     }
 
     #[test]
