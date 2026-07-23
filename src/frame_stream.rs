@@ -26,6 +26,27 @@ pub fn shift_left(buf: &mut [u8; MAX_FRAME_SIZE], len: &mut usize, count: usize)
     *len = remaining;
 }
 
+/// Appends the next bounded portion of one CDC packet into the frame buffer.
+///
+/// The caller drains complete/rejected frames after each chunk, then calls this
+/// again until `packet_offset == packet.len()`.
+pub fn append_packet_chunk(
+    buf: &mut [u8; MAX_FRAME_SIZE],
+    len: &mut usize,
+    packet: &[u8],
+    packet_offset: &mut usize,
+) -> usize {
+    if *len >= buf.len() || *packet_offset >= packet.len() {
+        return 0;
+    }
+
+    let copied = (buf.len() - *len).min(packet.len() - *packet_offset);
+    buf[*len..*len + copied].copy_from_slice(&packet[*packet_offset..*packet_offset + copied]);
+    *len += copied;
+    *packet_offset += copied;
+    copied
+}
+
 /// Drops a stalled partial frame without inventing a protocol response.
 ///
 /// On expiration, this authoritatively resets the buffered length to zero and
@@ -282,5 +303,52 @@ mod tests {
         assert!(clear_expired_partial(&mut len, &mut deadline, 1_350));
         assert_eq!(len, 0);
         assert!(!deadline.is_active());
+    }
+
+    #[test]
+    fn maximum_frame_tail_and_next_prefix_in_one_packet_are_preserved() {
+        let mut first = [0u8; MAX_FRAME_SIZE];
+        let first_len = encode_frame(
+            2,
+            100,
+            CommandType::TypeAscii,
+            &[b'a'; MAX_PAYLOAD_SIZE],
+            &mut first,
+        )
+        .unwrap();
+        assert_eq!(first_len, MAX_FRAME_SIZE);
+        let mut second = [0u8; MAX_FRAME_SIZE];
+        let second_len = encode_frame(2, 101, CommandType::Ping, &[], &mut second).unwrap();
+
+        let mut stream = [0u8; MAX_FRAME_SIZE + FRAME_OVERHEAD];
+        stream[..first_len].copy_from_slice(&first[..first_len]);
+        stream[first_len..first_len + second_len].copy_from_slice(&second[..second_len]);
+
+        let mut frame_buf = [0u8; MAX_FRAME_SIZE];
+        let mut frame_len = 0usize;
+        let mut observed = heapless::Vec::<u16, 2>::new();
+        for packet in stream[..first_len + second_len].chunks(64) {
+            let mut packet_offset = 0usize;
+            while packet_offset < packet.len() {
+                let copied =
+                    append_packet_chunk(&mut frame_buf, &mut frame_len, packet, &mut packet_offset);
+                assert!(copied > 0);
+
+                loop {
+                    match next_frame_action(&frame_buf[..frame_len]) {
+                        Some(FrameAction::Process(len)) => {
+                            let frame = crate::protocol::decode_frame(&frame_buf[..len]).unwrap();
+                            observed.push(frame.sequence).unwrap();
+                            shift_left(&mut frame_buf, &mut frame_len, len);
+                        }
+                        Some(FrameAction::NeedMore) | None => break,
+                        other => panic!("valid coalesced stream was damaged: {other:?}"),
+                    }
+                }
+            }
+        }
+
+        assert_eq!(observed.as_slice(), &[100, 101]);
+        assert_eq!(frame_len, 0);
     }
 }

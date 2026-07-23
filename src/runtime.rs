@@ -17,7 +17,9 @@ use crate::coordinator::{
 };
 use crate::error::ErrorCode;
 use crate::firmware_config::{capability_payload, info_payload};
-use crate::frame_stream::{FrameAction, next_frame_action, sequence_from_partial, shift_left};
+use crate::frame_stream::{
+    FrameAction, append_packet_chunk, next_frame_action, sequence_from_partial, shift_left,
+};
 use crate::led::{LedMode, LedSignal};
 use crate::owned_command::OwnedCommand;
 use crate::protocol::{
@@ -153,21 +155,25 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
             if read_len == 0 {
                 continue;
             }
-            if frame_len + read_len > frame_buf.len() {
-                crate::signal_led(LedSignal::Error);
-                let sequence = sequence_from_partial(&frame_buf[..frame_len]);
-                let version = response_version(&frame_buf[..frame_len]);
-                frame_len = 0;
-                queue_response_for_session(
-                    CachedResponse::nack(version, sequence, ErrorCode::FrameTooLong),
-                    runtime_session,
+            let mut packet_offset = 0usize;
+            while packet_offset < read_len {
+                let copied = append_packet_chunk(
+                    &mut frame_buf,
+                    &mut frame_len,
+                    &packet[..read_len],
+                    &mut packet_offset,
                 );
-                continue;
+                debug_assert!(copied > 0);
+                if copied == 0 {
+                    frame_len = 0;
+                    break;
+                }
+                drain_frames(&mut frame_buf, &mut frame_len, runtime_session).await;
+                if current_session_generation() != runtime_session || !receiver.dtr() {
+                    frame_len = 0;
+                    break;
+                }
             }
-
-            frame_buf[frame_len..frame_len + read_len].copy_from_slice(&packet[..read_len]);
-            frame_len += read_len;
-            drain_frames(&mut frame_buf, &mut frame_len, runtime_session).await;
         }
     }
 }
@@ -253,6 +259,8 @@ pub async fn dispatcher_task() -> ! {
                 let command_type = request.command_type();
                 let admission =
                     coordinator.admit_prepared_with_external_busy(request, emergency_in_flight);
+                // Legacy v1 controllers do not advertise/send heartbeats; arming their lease would
+                // unexpectedly release intentional held input after two seconds.
                 if version == PROTOCOL_VERSION
                     && !matches!(
                         &admission,
