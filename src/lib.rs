@@ -1,11 +1,13 @@
 #![cfg_attr(not(test), no_std)]
 
+pub mod batch;
 pub mod commands;
 pub mod error;
 pub mod firmware_config;
 pub mod frame_stream;
 pub mod input_state;
 pub mod led;
+pub mod owned_command;
 pub mod protocol;
 pub mod usb_identity;
 
