@@ -806,6 +806,8 @@ pub struct RuntimeModel {
     pending_stops: Vec<CompletionToken, RESPONSE_CACHE_SIZE>,
     emergency_in_flight: bool,
     session_generation: u32,
+    dtr_ready: bool,
+    applied_session: u32,
 }
 
 /// Observable work emitted by [`RuntimeModel`].
@@ -823,6 +825,15 @@ pub enum ModelEvent {
     CancelReleaseAndResetSession,
     /// Invalidate the session while the already queued release remains authoritative.
     CancelAndResetSession,
+}
+
+/// Pure decision for completing a USB read that began in a stamped runtime session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadSessionDecision {
+    /// The read belongs to the current session and its bytes may be framed.
+    Accept(u32),
+    /// A reset superseded the read; discard it and restart in the returned session.
+    DiscardAndRestart(u32),
 }
 
 /// Runtime conditions that require the same no-response emergency release path.
@@ -845,6 +856,8 @@ impl RuntimeModel {
             pending_stops: Vec::new(),
             emergency_in_flight: false,
             session_generation: 1,
+            dtr_ready: true,
+            applied_session: 1,
         }
     }
 
@@ -865,6 +878,34 @@ impl RuntimeModel {
     /// Reports whether a queued response belongs to the current runtime session.
     pub const fn response_is_current(&self, response: &CachedResponse) -> bool {
         response.runtime_session() == self.session_generation
+    }
+
+    /// Captures the session before starting a cancellable USB read.
+    pub const fn begin_read(&self) -> Option<u32> {
+        if self.dtr_ready && self.applied_session == self.session_generation {
+            Some(self.session_generation)
+        } else {
+            None
+        }
+    }
+
+    /// Records whether CDC DTR permits starting a new USB read.
+    pub fn note_dtr(&mut self, ready: bool) {
+        self.dtr_ready = ready;
+    }
+
+    /// Marks current-session queue draining and state invalidation complete.
+    pub fn complete_session_reset(&mut self) {
+        self.applied_session = self.session_generation;
+    }
+
+    /// Decides whether a completed read may enter framing after a possible reset.
+    pub const fn complete_read(&self, read_session: u32) -> ReadSessionDecision {
+        if read_session == self.session_generation {
+            ReadSessionDecision::Accept(read_session)
+        } else {
+            ReadSessionDecision::DiscardAndRestart(self.session_generation)
+        }
     }
 
     /// Applies coordinator admission and exposes the dispatch action relevant to runtime ordering.
@@ -981,11 +1022,14 @@ impl RuntimeModel {
     }
 
     /// Applies a no-response emergency transition and invalidates the current session cache.
-    pub fn safety_event(&mut self, _event: SafetyEvent) -> ModelEvent {
+    pub fn safety_event(&mut self, event: SafetyEvent) -> ModelEvent {
         self.input_held = false;
         self.pending_stops.clear();
         self.coordinator.clear_session();
         self.session_generation = advance_session_generation(self.session_generation);
+        if matches!(event, SafetyEvent::DtrLost | SafetyEvent::UsbDisabled) {
+            self.dtr_ready = false;
+        }
         if self.emergency_in_flight {
             ModelEvent::CancelAndResetSession
         } else {
@@ -1256,6 +1300,34 @@ mod tests {
         );
 
         assert!(!model.response_is_current(&response));
+    }
+
+    #[test]
+    fn request_reset_discards_pending_read_and_next_read_uses_new_session() {
+        let mut model = RuntimeModel::new();
+        let pending_read = model.begin_read().unwrap();
+        model.note_dtr(false);
+
+        assert_eq!(
+            model.safety_event(SafetyEvent::DtrLost),
+            ModelEvent::CancelReleaseAndResetSession
+        );
+        let new_session = model.session_generation();
+        assert_eq!(
+            model.complete_read(pending_read),
+            ReadSessionDecision::DiscardAndRestart(new_session)
+        );
+        assert_eq!(model.begin_read(), None);
+
+        model.note_dtr(true);
+        assert_eq!(model.begin_read(), None);
+        model.complete_session_reset();
+        let next_read = model.begin_read().unwrap();
+        assert_eq!(next_read, new_session);
+        assert_eq!(
+            model.complete_read(next_read),
+            ReadSessionDecision::Accept(new_session)
+        );
     }
 
     #[test]

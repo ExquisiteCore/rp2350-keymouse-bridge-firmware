@@ -18,6 +18,7 @@ pub static RESPONSES: Channel<CriticalSectionRawMutex, CachedResponse, 8> = Chan
 pub static SAFETY_EVENTS: Channel<CriticalSectionRawMutex, SafetyEvent, 4> = Channel::new();
 pub static CANCEL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static LEASE_REFRESH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+pub static REQUEST_RESET: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static RESPONSE_RESET: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
 pub struct RuntimeUsbHandler;
@@ -25,7 +26,7 @@ pub struct RuntimeUsbHandler;
 impl Handler for RuntimeUsbHandler {
     fn enabled(&mut self, enabled: bool) {
         if !enabled {
-            RESPONSE_RESET.signal(0);
+            crate::runtime::begin_session_reset();
             let _ = SAFETY_EVENTS.try_send(SafetyEvent::UsbDisabled);
         }
     }

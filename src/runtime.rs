@@ -27,7 +27,8 @@ use crate::protocol::{
 use crate::response_writer::send_cached_response;
 use crate::safety::{CONTROL_LEASE_MS, CancellationGeneration, PARTIAL_FRAME_TIMEOUT_MS};
 use crate::static_resources::{
-    CANCEL, JOBS, LEASE_REFRESH, REQUESTS, RESPONSE_RESET, RESPONSES, RESULTS, SAFETY_EVENTS,
+    CANCEL, JOBS, LEASE_REFRESH, REQUEST_RESET, REQUESTS, RESPONSE_RESET, RESPONSES, RESULTS,
+    SAFETY_EVENTS,
 };
 use crate::usb_device::{
     CdcControl, CdcReceiver, CdcSender, KeyboardReader, KeyboardWriter, MouseWriter,
@@ -37,6 +38,8 @@ const BUSY_RETRY_MS: u16 = 10;
 
 static GUARDED_WORK: AtomicBool = AtomicBool::new(false);
 static SESSION_GENERATION: AtomicU32 = AtomicU32::new(1);
+static APPLIED_SESSION: AtomicU32 = AtomicU32::new(1);
+static DTR_ASSERTED: AtomicBool = AtomicBool::new(false);
 
 /// One exclusive executor action. The single-slot channel prevents ordinary work queueing.
 // The batch stays inline intentionally: firmware has no allocator and the channel has capacity one.
@@ -79,25 +82,44 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
         let mut buffered_session = current_session_generation();
 
         loop {
-            let runtime_session = current_session_generation();
+            let current_session = current_session_generation();
+            if !receiver.dtr() || APPLIED_SESSION.load(Ordering::Acquire) != current_session {
+                frame_len = 0;
+                buffered_session = current_session;
+                let _ = REQUEST_RESET.wait().await;
+                continue;
+            }
+            let runtime_session = current_session;
             if runtime_session != buffered_session {
                 frame_len = 0;
                 buffered_session = runtime_session;
             }
-            if !receiver.dtr() {
-                frame_len = 0;
-            }
             let read_result = if frame_len == 0 {
-                receiver.read_packet(&mut packet).await
+                match select(REQUEST_RESET.wait(), receiver.read_packet(&mut packet)).await {
+                    Either::First(_) => {
+                        frame_len = 0;
+                        buffered_session = current_session_generation();
+                        continue;
+                    }
+                    Either::Second(result) => result,
+                }
             } else {
                 match select(
-                    receiver.read_packet(&mut packet),
-                    Timer::after_millis(PARTIAL_FRAME_TIMEOUT_MS),
+                    REQUEST_RESET.wait(),
+                    select(
+                        receiver.read_packet(&mut packet),
+                        Timer::after_millis(PARTIAL_FRAME_TIMEOUT_MS),
+                    ),
                 )
                 .await
                 {
-                    Either::First(result) => result,
-                    Either::Second(()) => {
+                    Either::First(_) => {
+                        frame_len = 0;
+                        buffered_session = current_session_generation();
+                        continue;
+                    }
+                    Either::Second(Either::First(result)) => result,
+                    Either::Second(Either::Second(())) => {
                         frame_len = 0;
                         continue;
                     }
@@ -360,13 +382,17 @@ pub async fn dispatcher_task() -> ! {
                 }
             },
             Either3::First(_event) => {
-                let runtime_session = advance_runtime_session();
+                let runtime_session = current_session_generation();
                 RESPONSE_RESET.signal(runtime_session);
                 while REQUESTS.try_receive().is_ok() {}
                 while RESPONSES.try_receive().is_ok() {}
                 batch = None;
                 pending_stops.clear();
                 coordinator.clear_session();
+                APPLIED_SESSION.store(runtime_session, Ordering::Release);
+                if DTR_ASSERTED.load(Ordering::Acquire) {
+                    REQUEST_RESET.signal(runtime_session);
+                }
                 schedule_emergency(&mut cancellation, &mut emergency_in_flight).await;
             }
         }
@@ -605,17 +631,26 @@ fn current_session_generation() -> u32 {
     SESSION_GENERATION.load(Ordering::Acquire)
 }
 
-fn advance_runtime_session() -> u32 {
-    let next = advance_session_generation(current_session_generation());
-    SESSION_GENERATION.store(next, Ordering::Release);
+/// Advances the runtime session before publishing a safety event and cancels both transports.
+pub(crate) fn begin_session_reset() -> u32 {
+    let previous = SESSION_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(advance_session_generation(current))
+        })
+        .expect("session generation update cannot fail");
+    let next = advance_session_generation(previous);
+    REQUEST_RESET.signal(next);
+    RESPONSE_RESET.signal(next);
     next
 }
 
 fn queue_response(response: CachedResponse) {
-    queue_response_for_session(response, current_session_generation());
+    queue_response_for_session(response, APPLIED_SESSION.load(Ordering::Acquire));
 }
 
 fn queue_response_for_session(response: CachedResponse, runtime_session: u32) {
+    // Transport backpressure may drop a queued frame: final responses remain replayable in the
+    // coordinator cache, and blocking this dispatcher would prevent safety/reset progress.
     let _ = RESPONSES.try_send(response.with_runtime_session(runtime_session));
 }
 
@@ -653,12 +688,22 @@ pub async fn response_task(mut sender: CdcSender) -> ! {
 #[embassy_executor::task]
 pub async fn cdc_control_task(control: CdcControl) -> ! {
     let mut previous_dtr = control.dtr();
+    DTR_ASSERTED.store(previous_dtr, Ordering::Release);
+    if previous_dtr && APPLIED_SESSION.load(Ordering::Acquire) == current_session_generation() {
+        REQUEST_RESET.signal(current_session_generation());
+    }
     loop {
         control.control_changed().await;
         let dtr = control.dtr();
+        DTR_ASSERTED.store(dtr, Ordering::Release);
         if previous_dtr && !dtr {
-            RESPONSE_RESET.signal(current_session_generation());
+            begin_session_reset();
             SAFETY_EVENTS.send(SafetyEvent::DtrLost).await;
+        } else if !previous_dtr
+            && dtr
+            && APPLIED_SESSION.load(Ordering::Acquire) == current_session_generation()
+        {
+            REQUEST_RESET.signal(current_session_generation());
         }
         previous_dtr = dtr;
     }
@@ -672,6 +717,7 @@ pub async fn lease_task() -> ! {
             match select(Timer::after_millis(CONTROL_LEASE_MS), LEASE_REFRESH.wait()).await {
                 Either::First(()) => {
                     if GUARDED_WORK.load(Ordering::Acquire) {
+                        begin_session_reset();
                         SAFETY_EVENTS.send(SafetyEvent::LeaseExpired).await;
                     }
                     break;
