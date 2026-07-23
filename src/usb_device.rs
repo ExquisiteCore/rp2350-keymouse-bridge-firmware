@@ -5,9 +5,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_usb::Config;
-use embassy_usb::class::cdc_acm::CdcAcmClass;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, ControlChanged, Receiver, Sender};
 use embassy_usb::class::hid::{
-    Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidState,
+    Config as HidConfig, HidBootProtocol, HidReader, HidSubclass, HidWriter, State as HidState,
 };
 use usbd_hid::descriptor::{KeyboardReport, MouseReport, SerializedDescriptor};
 
@@ -18,7 +18,11 @@ static CAPS_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub type UsbDriver = Driver<'static, USB>;
 pub type CdcClass = CdcAcmClass<'static, UsbDriver>;
+pub type CdcSender = Sender<'static, UsbDriver>;
+pub type CdcReceiver = Receiver<'static, UsbDriver>;
+pub type CdcControl = ControlChanged<'static>;
 pub type KeyboardWriter = HidWriter<'static, UsbDriver, 8>;
+pub type KeyboardReader = HidReader<'static, UsbDriver, 1>;
 pub type MouseWriter = HidWriter<'static, UsbDriver, 8>;
 pub type UsbHidState = HidState<'static>;
 

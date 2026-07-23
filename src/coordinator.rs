@@ -238,6 +238,7 @@ impl CompletionToken {
 // Commands stay inline so requests remain allocation-free under `no_std`.
 #[allow(clippy::large_enum_variant)]
 pub enum OwnedRequestBody {
+    Raw(Vec<u8, MAX_PAYLOAD_SIZE>),
     Command(OwnedCommand),
     BatchBegin,
     BatchEnd,
@@ -257,6 +258,25 @@ pub struct OwnedRequest {
 }
 
 impl OwnedRequest {
+    /// Copies a validated wire request for later dispatcher-side admission.
+    pub fn from_frame(frame: &Frame<'_>) -> Result<Self, ErrorCode> {
+        let request_kind = validate_request(frame).map_err(ErrorCode::from)?;
+        let mut payload = Vec::new();
+        payload
+            .extend_from_slice(frame.payload)
+            .map_err(|_| ErrorCode::FrameTooLong)?;
+        Ok(Self {
+            version: frame.version,
+            flags: frame.flags,
+            sequence: frame.sequence,
+            command_type: frame.command_type,
+            fingerprint: fingerprint(frame),
+            request_kind,
+            completion_token: None,
+            body: OwnedRequestBody::Raw(payload),
+        })
+    }
+
     /// Returns the accepted protocol version.
     pub const fn version(&self) -> u8 {
         self.version
@@ -423,6 +443,13 @@ impl Coordinator {
         }
     }
 
+    /// Discards an open collection while preserving completed retry-cache entries.
+    pub fn abort_batch(&mut self) {
+        if self.batch_state == BatchState::Collecting {
+            self.batch_state = BatchState::Idle;
+        }
+    }
+
     /// Starts a fresh session and invalidates all outstanding completion tokens.
     pub fn clear_session(&mut self) {
         self.session_generation = self
@@ -447,18 +474,21 @@ impl Coordinator {
     }
 
     fn admit_frame(&mut self, frame: &Frame<'_>) -> Admission {
-        let request_kind = match validate_request(frame) {
-            Ok(kind) => kind,
-            Err(error) => return Admission::Reject(error.into()),
-        };
-        let fingerprint = fingerprint(frame);
-        if request_kind == RequestKind::ResponseExpected
+        match OwnedRequest::from_frame(frame) {
+            Ok(request) => self.admit_prepared(request),
+            Err(error) => Admission::Reject(error),
+        }
+    }
+
+    /// Applies dispatcher-side admission to a receiver-owned raw request.
+    pub fn admit_prepared(&mut self, mut request: OwnedRequest) -> Admission {
+        if request.request_kind == RequestKind::ResponseExpected
             && let Some(entry) = self
                 .cache
                 .iter()
-                .find(|entry| entry.sequence == frame.sequence)
+                .find(|entry| entry.sequence == request.sequence)
         {
-            if entry.fingerprint != fingerprint {
+            if entry.fingerprint != request.fingerprint {
                 return Admission::Reject(ErrorCode::SequenceConflict);
             }
             return match &entry.state {
@@ -467,21 +497,24 @@ impl Coordinator {
             };
         }
 
-        let body = match own_request_body(frame) {
-            Ok(body) => body,
-            Err(error) => return Admission::Reject(error.into()),
+        let decoded = match &request.body {
+            OwnedRequestBody::Raw(payload) => {
+                let frame = Frame {
+                    version: request.version,
+                    flags: request.flags,
+                    sequence: request.sequence,
+                    command_type: request.command_type,
+                    payload: payload.as_slice(),
+                };
+                match own_request_body(&frame) {
+                    Ok(body) => body,
+                    Err(error) => return Admission::Reject(error.into()),
+                }
+            }
+            body => body.clone(),
         };
-        let request_class = classify_request(&body);
-        let request = OwnedRequest {
-            version: frame.version,
-            flags: frame.flags,
-            sequence: frame.sequence,
-            command_type: frame.command_type,
-            fingerprint,
-            request_kind,
-            completion_token: None,
-            body,
-        };
+        request.body = decoded;
+        let request_class = classify_request(&request.body);
 
         match request_class {
             RequestClass::BatchBegin => self.admit_batch_begin(request),
@@ -700,6 +733,7 @@ fn own_request_body(frame: &Frame<'_>) -> Result<OwnedRequestBody, CommandError>
 
 fn classify_request(body: &OwnedRequestBody) -> RequestClass {
     match body {
+        OwnedRequestBody::Raw(_) => unreachable!("raw requests must be decoded before admission"),
         OwnedRequestBody::BatchBegin => RequestClass::BatchBegin,
         OwnedRequestBody::BatchEnd => RequestClass::BatchEnd,
         OwnedRequestBody::Command(OwnedCommand::StopAll) => RequestClass::StopAll,
@@ -714,6 +748,162 @@ fn classify_request(body: &OwnedRequestBody) -> RequestClass {
 }
 
 impl Default for Coordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Host-testable projection of dispatcher ordering around urgent cancellation.
+pub struct RuntimeModel {
+    coordinator: Coordinator,
+    input_held: bool,
+}
+
+/// Observable work emitted by [`RuntimeModel`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelEvent {
+    /// Begin handling the accepted request with this sequence.
+    Start(u16),
+    /// Send an immediate, replayed, busy, or rejected response.
+    Respond(CachedResponse),
+    /// Cancel the active executor and release both HID interfaces before ACKing STOP_ALL.
+    CancelAndRelease { stop_sequence: u16 },
+    /// Cancel, release, and invalidate the current controller session.
+    CancelReleaseAndResetSession,
+}
+
+/// Runtime conditions that require the same no-response emergency release path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SafetyEvent {
+    /// The host deasserted the CDC DTR control signal.
+    DtrLost,
+    /// The controller lease expired while guarded work existed.
+    LeaseExpired,
+    /// The USB device was disabled or disconnected.
+    UsbDisabled,
+}
+
+impl RuntimeModel {
+    /// Creates an idle runtime model.
+    pub const fn new() -> Self {
+        Self {
+            coordinator: Coordinator::new(),
+            input_held: false,
+        }
+    }
+
+    /// Applies coordinator admission and exposes the dispatch action relevant to runtime ordering.
+    pub fn accept(&mut self, frame: Frame<'_>) -> ModelEvent {
+        let version = frame.version;
+        let sequence = frame.sequence;
+        match self.coordinator.admit(&frame) {
+            Admission::Execute(request)
+            | Admission::Collect(request)
+            | Admission::Bypass(request)
+            | Admission::NoResponse(request) => ModelEvent::Start(request.sequence()),
+            Admission::Stop(request) => ModelEvent::CancelAndRelease {
+                stop_sequence: request.sequence(),
+            },
+            Admission::Replay(response) | Admission::Immediate(response) => {
+                ModelEvent::Respond(response)
+            }
+            Admission::Busy(reason) => {
+                ModelEvent::Respond(CachedResponse::busy(version, sequence, reason, 1))
+            }
+            Admission::Reject(error) => {
+                ModelEvent::Respond(CachedResponse::nack(version, sequence, error))
+            }
+        }
+    }
+
+    /// Completes a cancelled executor before completing the active STOP_ALL request.
+    pub fn complete_cancelled(&mut self, sequence: u16) -> Vec<CachedResponse, 2> {
+        let mut responses = Vec::new();
+        if let Some(token) = self.active_token(sequence) {
+            let response = token.nack(ErrorCode::Cancelled);
+            let completed = self.coordinator.complete(token, response.clone());
+            debug_assert_eq!(completed, Ok(()));
+            let pushed = responses.push(response);
+            debug_assert!(pushed.is_ok());
+        }
+
+        if let Some(token) = self.active_stop_token() {
+            let response = token.ack();
+            let completed = self.coordinator.complete(token, response.clone());
+            debug_assert_eq!(completed, Ok(()));
+            let pushed = responses.push(response);
+            debug_assert!(pushed.is_ok());
+        }
+        self.input_held = false;
+        responses
+    }
+
+    /// Opens a v2 batch and retains its replayable ACK in the coordinator cache.
+    pub fn begin_batch(&mut self, sequence: u16) -> Result<(), ErrorCode> {
+        match self.accept(Frame {
+            version: crate::protocol::PROTOCOL_VERSION,
+            flags: 0,
+            sequence,
+            command_type: CommandType::BatchBegin,
+            payload: &[],
+        }) {
+            ModelEvent::Respond(response) if response.command_type() == CommandType::Ack => Ok(()),
+            ModelEvent::Respond(response) if response.command_type() == CommandType::Nack => {
+                Err(ErrorCode::BatchState)
+            }
+            _ => Err(ErrorCode::BatchState),
+        }
+    }
+
+    /// Records whether the runtime currently owns any pressed keyboard or mouse input.
+    pub fn note_input_held(&mut self, held: bool) {
+        self.input_held = held;
+    }
+
+    /// Applies a no-response emergency transition and invalidates the current session cache.
+    pub fn safety_event(&mut self, _event: SafetyEvent) -> ModelEvent {
+        self.input_held = false;
+        self.coordinator.clear_session();
+        ModelEvent::CancelReleaseAndResetSession
+    }
+
+    /// Reports whether a batch is collecting or executing.
+    pub const fn has_batch(&self) -> bool {
+        !matches!(self.coordinator.batch_mode(), BatchMode::Idle)
+    }
+
+    /// Reports whether the current session retains this sequence.
+    pub fn has_cached_sequence(&self, sequence: u16) -> bool {
+        self.coordinator.has_cached_sequence(sequence)
+    }
+
+    fn active_token(&self, sequence: u16) -> Option<CompletionToken> {
+        self.coordinator
+            .cache
+            .iter()
+            .find(|entry| entry.sequence == sequence && entry.state == CacheState::Active)
+            .map(|entry| entry.token)
+    }
+
+    fn active_stop_token(&self) -> Option<CompletionToken> {
+        self.coordinator
+            .cache
+            .iter()
+            .find(|entry| {
+                let stop = Frame {
+                    version: entry.token.version(),
+                    flags: 0,
+                    sequence: entry.sequence,
+                    command_type: CommandType::StopAll,
+                    payload: &[],
+                };
+                entry.state == CacheState::Active && entry.fingerprint == fingerprint(&stop)
+            })
+            .map(|entry| entry.token)
+    }
+}
+
+impl Default for RuntimeModel {
     fn default() -> Self {
         Self::new()
     }
@@ -817,6 +1007,75 @@ mod tests {
             completion_token: None,
             body: own_request_body(frame).unwrap(),
         }
+    }
+
+    fn ack(sequence: u16) -> CachedResponse {
+        CachedResponse::ack(2, sequence)
+    }
+
+    fn nack(sequence: u16, error: ErrorCode) -> CachedResponse {
+        CachedResponse::nack(2, sequence, error)
+    }
+
+    #[test]
+    fn stop_during_wait_cancels_wait_then_acknowledges_stop() {
+        let mut model = RuntimeModel::new();
+        assert_eq!(
+            model.accept(request(2, 10, CommandType::WaitMs, &[0, 0, 0x13, 0x88])),
+            ModelEvent::Start(10)
+        );
+        assert_eq!(
+            model.accept(request(2, 11, CommandType::StopAll, &[])),
+            ModelEvent::CancelAndRelease { stop_sequence: 11 }
+        );
+        let responses = model.complete_cancelled(10);
+        assert_eq!(
+            responses.as_slice(),
+            &[nack(10, ErrorCode::Cancelled), ack(11)]
+        );
+    }
+
+    #[test]
+    fn dtr_loss_clears_batch_cache_and_input_without_response() {
+        let mut model = RuntimeModel::new();
+        model.begin_batch(20).unwrap();
+        model.note_input_held(true);
+        assert_eq!(
+            model.safety_event(SafetyEvent::DtrLost),
+            ModelEvent::CancelReleaseAndResetSession
+        );
+        assert!(!model.has_batch());
+        assert!(!model.has_cached_sequence(20));
+    }
+
+    #[test]
+    fn receiver_owned_request_is_admitted_only_by_dispatcher() {
+        let frame = request(2, 21, CommandType::WaitMs, &[0, 0, 0, 5]);
+        let owned = OwnedRequest::from_frame(&frame).unwrap();
+        assert_eq!(owned.completion_token(), None);
+
+        let mut coordinator = Coordinator::new();
+        let Admission::Execute(admitted) = coordinator.admit_prepared(owned) else {
+            panic!("prepared request should be admitted for execution");
+        };
+        assert_eq!(admitted.sequence(), 21);
+        assert_eq!(
+            admitted.body(),
+            &OwnedRequestBody::Command(OwnedCommand::WaitMs(5))
+        );
+        assert!(admitted.completion_token().is_some());
+    }
+
+    #[test]
+    fn abort_batch_discards_collection_without_resetting_completed_cache() {
+        let mut coordinator = Coordinator::new();
+        begin_batch(&mut coordinator, 22);
+        assert_eq!(coordinator.batch_mode(), BatchMode::Collecting);
+
+        coordinator.abort_batch();
+
+        assert_eq!(coordinator.batch_mode(), BatchMode::Idle);
+        assert!(coordinator.has_cached_sequence(22));
     }
 
     #[test]
