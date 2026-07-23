@@ -26,6 +26,11 @@ pub fn shift_left(buf: &mut [u8; MAX_FRAME_SIZE], len: &mut usize, count: usize)
     *len = remaining;
 }
 
+/// Drops a stalled partial frame without inventing a protocol response.
+///
+/// On expiration, this authoritatively resets the buffered length to zero and
+/// disarms the deadline. The caller remains responsible for response policy,
+/// including emitting no response when the sequence is not reliable.
 pub fn clear_expired_partial(
     len: &mut usize,
     deadline: &mut PartialFrameDeadline,
@@ -228,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_rejection_can_explicitly_disarm_the_deadline() {
+    fn oversized_rejection_with_empty_buffer_disarms_deadline() {
         let mut buf = [0u8; MAX_FRAME_SIZE];
         let oversized = [MAGIC[0], MAGIC[1], 1, 0, 0x12, 0x34, 0x01, 0x00, 0xF1];
         buf[..oversized.len()].copy_from_slice(&oversized);
@@ -240,10 +245,42 @@ mod tests {
             panic!("oversized frame was not rejected");
         };
         shift_left(&mut buf, &mut len, rejected);
-        deadline.clear();
+        deadline.note_bytes(1_001, len);
 
         assert_eq!(len, 0);
         assert!(!deadline.is_active());
         assert!(!clear_expired_partial(&mut len, &mut deadline, 9_999));
+    }
+
+    #[test]
+    fn rejected_prefix_preserves_deadline_for_coalesced_trailing_partial() {
+        let mut valid = [0u8; MAX_FRAME_SIZE];
+        let _valid_len = encode_frame(1, 10, CommandType::Ping, &[], &mut valid).unwrap();
+        let oversized_prefix = [
+            MAGIC[0], MAGIC[1], 1, 0, 0x12, 0x34, 0x01, 0x00, 0xF1, 0x00, 0x00,
+        ];
+        let mut buf = [0u8; MAX_FRAME_SIZE];
+        buf[..FRAME_OVERHEAD].copy_from_slice(&oversized_prefix);
+        buf[FRAME_OVERHEAD..FRAME_OVERHEAD + 4].copy_from_slice(&valid[..4]);
+        let mut len = FRAME_OVERHEAD + 4;
+        let mut deadline = PartialFrameDeadline::new(PARTIAL_FRAME_TIMEOUT_MS);
+        deadline.note_bytes(1_000, len);
+
+        let Some(FrameAction::Reject { len: rejected, .. }) = next_frame_action(&buf[..len]) else {
+            panic!("oversized prefix was not rejected");
+        };
+        assert_eq!(rejected, FRAME_OVERHEAD);
+
+        shift_left(&mut buf, &mut len, rejected);
+        deadline.note_bytes(1_100, len);
+
+        assert_eq!(len, 4);
+        assert_eq!(next_frame_action(&buf[..len]), Some(FrameAction::NeedMore));
+        assert!(deadline.is_active());
+        assert_eq!(deadline.deadline_ms(), Some(1_350));
+        assert!(!clear_expired_partial(&mut len, &mut deadline, 1_349));
+        assert!(clear_expired_partial(&mut len, &mut deadline, 1_350));
+        assert_eq!(len, 0);
+        assert!(!deadline.is_active());
     }
 }

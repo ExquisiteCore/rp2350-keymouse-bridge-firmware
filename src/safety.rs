@@ -6,15 +6,29 @@
 
 const U64_HALF_RANGE: u64 = 1 << 63;
 
+/// Maximum time a partial frame may remain without reported progress.
 pub const PARTIAL_FRAME_TIMEOUT_MS: u64 = 250;
+/// Recommended interval between controller heartbeat frames.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 500;
+/// Time controller-owned guarded work may continue without a lease refresh.
 pub const CONTROL_LEASE_MS: u64 = 2_000;
+
+const fn assert_valid_duration(duration_ms: u64) {
+    assert!(
+        duration_ms > 0 && duration_ms < U64_HALF_RANGE,
+        "timing duration must be in 1..2^63 milliseconds"
+    );
+}
 
 #[must_use]
 fn deadline_reached(now_ms: u64, deadline_ms: u64) -> bool {
     now_ms.wrapping_sub(deadline_ms) < U64_HALF_RANGE
 }
 
+/// Fixed-size state for a controller lease.
+///
+/// A new lease is unarmed. Once refreshed, it expires at the exact deadline,
+/// but requests release only while guarded work exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LeaseState {
     duration_ms: u64,
@@ -23,8 +37,15 @@ pub struct LeaseState {
 }
 
 impl LeaseState {
+    /// Creates an unarmed lease with a fixed duration.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `duration_ms` is in `1..2^63`, the domain required by
+    /// wrapping deadline comparisons.
     #[must_use]
     pub const fn new(duration_ms: u64) -> Self {
+        assert_valid_duration(duration_ms);
         Self {
             duration_ms,
             deadline_ms: 0,
@@ -32,26 +53,31 @@ impl LeaseState {
         }
     }
 
+    /// Replaces the current deadline with `now_ms + duration_ms`.
     pub fn refresh(&mut self, now_ms: u64) {
         self.deadline_ms = now_ms.wrapping_add(self.duration_ms);
         self.armed = true;
     }
 
+    /// Disarms the lease until the next refresh.
     pub fn clear(&mut self) {
         self.deadline_ms = 0;
         self.armed = false;
     }
 
+    /// Returns the configured lease duration.
     #[must_use]
     pub const fn duration_ms(&self) -> u64 {
         self.duration_ms
     }
 
+    /// Returns whether the lease has been refreshed and not cleared.
     #[must_use]
     pub const fn is_armed(&self) -> bool {
         self.armed
     }
 
+    /// Returns the active wrapping deadline, or `None` while unarmed.
     #[must_use]
     pub const fn deadline_ms(&self) -> Option<u64> {
         if self.armed {
@@ -61,12 +87,20 @@ impl LeaseState {
         }
     }
 
+    /// Returns whether guarded work must be released at `now_ms`.
+    ///
+    /// The exact deadline is expired. An unarmed lease or a caller with no
+    /// guarded work never requests release.
     #[must_use]
     pub fn should_release(&self, now_ms: u64, guarded_work: bool) -> bool {
         guarded_work && self.armed && deadline_reached(now_ms, self.deadline_ms)
     }
 }
 
+/// Fixed-size deadline state for an incomplete stream frame.
+///
+/// An active deadline expires at its exact deadline. Checking expiration does
+/// not refresh it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartialFrameDeadline {
     timeout_ms: u64,
@@ -75,8 +109,15 @@ pub struct PartialFrameDeadline {
 }
 
 impl PartialFrameDeadline {
+    /// Creates an inactive partial-frame deadline with a fixed timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `timeout_ms` is in `1..2^63`, the domain required by
+    /// wrapping deadline comparisons.
     #[must_use]
     pub const fn new(timeout_ms: u64) -> Self {
+        assert_valid_duration(timeout_ms);
         Self {
             timeout_ms,
             deadline_ms: 0,
@@ -84,6 +125,14 @@ impl PartialFrameDeadline {
         }
     }
 
+    /// Records explicit progress and refreshes the deadline.
+    ///
+    /// Call this only after bytes are appended or buffered data advances. An
+    /// unchanged `unconsumed_len` can still be real progress when bytes were
+    /// consumed and replaced, so this method intentionally trusts the caller.
+    /// Polling must use [`Self::expired`] or the stream helper and must not call
+    /// `note_bytes`. Passing zero reports an empty buffer and disarms the
+    /// deadline.
     pub fn note_bytes(&mut self, now_ms: u64, unconsumed_len: usize) {
         if unconsumed_len == 0 {
             self.clear();
@@ -94,21 +143,25 @@ impl PartialFrameDeadline {
         self.active = true;
     }
 
+    /// Disarms the deadline until progress is reported again.
     pub fn clear(&mut self) {
         self.deadline_ms = 0;
         self.active = false;
     }
 
+    /// Returns the configured partial-frame timeout.
     #[must_use]
     pub const fn timeout_ms(&self) -> u64 {
         self.timeout_ms
     }
 
+    /// Returns whether the deadline is armed.
     #[must_use]
     pub const fn is_active(&self) -> bool {
         self.active
     }
 
+    /// Returns the active wrapping deadline, or `None` while inactive.
     #[must_use]
     pub const fn deadline_ms(&self) -> Option<u64> {
         if self.active {
@@ -118,34 +171,46 @@ impl PartialFrameDeadline {
         }
     }
 
+    /// Checks expiration without changing or refreshing the deadline.
+    ///
+    /// The exact deadline is expired.
     #[must_use]
     pub fn expired(&self, now_ms: u64) -> bool {
         self.active && deadline_reached(now_ms, self.deadline_ms)
     }
 }
 
+/// Nonzero generation used to invalidate bounded in-flight operations.
+///
+/// Snapshots are intended for operations whose lifetime is bounded well below
+/// a full `u32` generation cycle. After enough cancellations, an old snapshot
+/// can exhibit ABA; wrapping skips zero and continues at one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CancellationGeneration {
     generation: u32,
 }
 
 impl CancellationGeneration {
+    /// Creates a generation initialized to one.
     #[must_use]
     pub const fn new() -> Self {
         Self { generation: 1 }
     }
 
+    /// Returns the current nonzero generation.
     #[must_use]
     pub const fn current(&self) -> u32 {
         self.generation
     }
 
+    /// Advances once, skips zero on wrap, and returns the new generation.
     pub fn cancel(&mut self) -> u32 {
         let next = self.generation.wrapping_add(1);
         self.generation = if next == 0 { 1 } else { next };
         self.generation
     }
 
+    /// Reports whether a bounded-operation snapshot is no longer current.
     #[must_use]
     pub const fn changed_since(&self, snapshot: u32) -> bool {
         self.generation != snapshot
@@ -167,6 +232,48 @@ mod tests {
         assert_eq!(PARTIAL_FRAME_TIMEOUT_MS, 250);
         assert_eq!(HEARTBEAT_INTERVAL_MS, 500);
         assert_eq!(CONTROL_LEASE_MS, 2_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn lease_rejects_zero_duration() {
+        let _ = LeaseState::new(0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn lease_rejects_half_range_duration() {
+        let _ = LeaseState::new(U64_HALF_RANGE);
+    }
+
+    #[test]
+    fn lease_accepts_valid_duration_boundaries() {
+        assert_eq!(LeaseState::new(1).duration_ms(), 1);
+        assert_eq!(
+            LeaseState::new(U64_HALF_RANGE - 1).duration_ms(),
+            U64_HALF_RANGE - 1
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn partial_deadline_rejects_zero_timeout() {
+        let _ = PartialFrameDeadline::new(0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn partial_deadline_rejects_half_range_timeout() {
+        let _ = PartialFrameDeadline::new(U64_HALF_RANGE);
+    }
+
+    #[test]
+    fn partial_deadline_accepts_valid_timeout_boundaries() {
+        assert_eq!(PartialFrameDeadline::new(1).timeout_ms(), 1);
+        assert_eq!(
+            PartialFrameDeadline::new(U64_HALF_RANGE - 1).timeout_ms(),
+            U64_HALF_RANGE - 1
+        );
     }
 
     #[test]
@@ -251,6 +358,17 @@ mod tests {
         assert!(!deadline.expired(1_498));
         assert!(deadline.expired(1_499));
         assert!(deadline.expired(1_500));
+    }
+
+    #[test]
+    fn stalled_polling_does_not_refresh_unchanged_partial_data() {
+        let mut deadline = PartialFrameDeadline::new(250);
+        deadline.note_bytes(1_000, 4);
+
+        assert!(!deadline.expired(1_249));
+        assert_eq!(deadline.deadline_ms(), Some(1_250));
+        assert!(deadline.expired(1_250));
+        assert_eq!(deadline.deadline_ms(), Some(1_250));
     }
 
     #[test]

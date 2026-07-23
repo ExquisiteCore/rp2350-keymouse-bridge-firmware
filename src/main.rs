@@ -17,6 +17,7 @@ mod hid_report;
 mod led;
 mod protocol;
 mod response_writer;
+mod safety;
 mod static_resources;
 mod usb_device;
 mod usb_identity;
