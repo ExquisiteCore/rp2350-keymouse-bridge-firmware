@@ -240,6 +240,36 @@ mod execution_core_tests {
         }
     }
 
+    fn assert_direct_batch_marker_is_rejected_without_hid_effect(command: Command<'_>) {
+        let mut backend = FakeExecutionBackend::cancelling_after_report(usize::MAX);
+        let mut state = InputState::new();
+        state
+            .keyboard
+            .key_down(KeyStroke {
+                modifier: 0x02,
+                keycode: 0x04,
+            })
+            .unwrap();
+        state.mouse.button_down(MouseButton::Right);
+        let state_before = state;
+
+        let result = run_ready(execute_command(command, 2, false, &mut backend, &mut state));
+
+        assert_eq!(result, Err(ErrorCode::BadCommand));
+        assert!(backend.reports.is_empty());
+        assert_eq!(state, state_before);
+    }
+
+    #[test]
+    fn direct_batch_begin_marker_is_rejected_without_hid_effect() {
+        assert_direct_batch_marker_is_rejected_without_hid_effect(Command::BatchBegin);
+    }
+
+    #[test]
+    fn direct_batch_end_marker_is_rejected_without_hid_effect() {
+        assert_direct_batch_marker_is_rejected_without_hid_effect(Command::BatchEnd);
+    }
+
     #[test]
     fn type_ascii_generation_change_between_strokes_stops_next_stroke_and_resets() {
         let mut backend = FakeExecutionBackend::cancelling_after_report(2);

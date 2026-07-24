@@ -161,6 +161,12 @@ mod tests {
     }
 
     #[test]
+    fn batch_protocol_boundaries_are_pinned_to_wire_contract() {
+        assert_eq!(BATCH_MAX_COMMANDS, 32);
+        assert_eq!(BATCH_MAX_PAYLOAD_BYTES, 8 * 1024);
+    }
+
+    #[test]
     fn batch_validates_shadow_state_before_accepting_text() {
         let mut batch = BatchCollector::begin(InputState::new());
         batch

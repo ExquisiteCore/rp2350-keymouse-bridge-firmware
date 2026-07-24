@@ -42,7 +42,8 @@ impl OwnedCommand {
             Command::MouseWheel(wheel) => Ok(Self::MouseWheel(wheel)),
             Command::WaitMs(wait_ms) => Ok(Self::WaitMs(wait_ms)),
             Command::StopAll => Ok(Self::StopAll),
-            Command::BatchBegin | Command::BatchEnd => Err(CommandError::UnsupportedCommand),
+            Command::BatchBegin => Err(CommandError::UnsupportedCommand),
+            Command::BatchEnd => Err(CommandError::UnsupportedCommand),
         }
     }
 

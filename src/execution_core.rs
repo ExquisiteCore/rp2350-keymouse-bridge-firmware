@@ -135,7 +135,8 @@ pub(crate) async fn execute_command_once<B: ExecutionBackend>(
             backend.delay(u64::from(milliseconds)).await?;
             DeviceResponse::Ack
         }
-        Command::BatchBegin | Command::BatchEnd => DeviceResponse::Ack,
+        Command::BatchBegin => return Err(ErrorCode::BadCommand),
+        Command::BatchEnd => return Err(ErrorCode::BadCommand),
         Command::StopAll => {
             reset_inputs(backend, state).await?;
             DeviceResponse::Ack
