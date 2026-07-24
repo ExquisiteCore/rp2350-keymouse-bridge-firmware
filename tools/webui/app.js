@@ -71,15 +71,50 @@ export class SerialHidClient {
       throw new Error("当前浏览器不支持 Web Serial");
     }
 
-    this.port = await this.serial.requestPort({
-      filters: [{ usbVendorId: 0xcafe, usbProductId: 0x2350 }],
-    });
-    await this.port.open({ baudRate: 115200, bufferSize: MAX_FRAME_SIZE });
-    this.writer = this.port.writable.getWriter();
-    await this.port.setSignals({ dataTerminalReady: true });
-    this.connected = true;
-    this.startHeartbeat();
-    this.readTask = this.readLoop();
+    let port = null;
+    let writer = null;
+    let opened = false;
+    let dtrAttempted = false;
+
+    try {
+      port = await this.serial.requestPort({
+        filters: [{ usbVendorId: 0xcafe, usbProductId: 0x2350 }],
+      });
+      await port.open({ baudRate: 115200, bufferSize: MAX_FRAME_SIZE });
+      opened = true;
+      writer = port.writable.getWriter();
+      dtrAttempted = true;
+      await port.setSignals({ dataTerminalReady: true });
+
+      this.port = port;
+      this.writer = writer;
+      this.connected = true;
+      this.startHeartbeat();
+      this.readTask = this.readLoop();
+    } catch (error) {
+      if (dtrAttempted) {
+        try {
+          await port.setSignals({ dataTerminalReady: false });
+        } catch {}
+      }
+      if (writer) {
+        try {
+          writer.releaseLock();
+        } catch {}
+      }
+      if (opened) {
+        try {
+          await port.close();
+        } catch {}
+      }
+
+      this.port = null;
+      this.writer = null;
+      this.connected = false;
+      this.stopHeartbeat();
+      this.readTask = null;
+      throw error;
+    }
   }
 
   startHeartbeat() {

@@ -112,6 +112,54 @@ function fakeSerial({ readable = false } = {}) {
   };
 }
 
+function serialWithInitializationFailure(stage) {
+  const failedEvents = [];
+  const failedWriter = {
+    releaseLock() {
+      failedEvents.push("writer:release");
+    },
+  };
+  const failedPort = {
+    readable: null,
+    writable: {
+      getWriter() {
+        failedEvents.push("writer:get");
+        if (stage === "getWriter") {
+          throw new Error("getWriter failed");
+        }
+        return failedWriter;
+      },
+    },
+    async open() {
+      failedEvents.push("open");
+      if (stage === "open") {
+        throw new Error("open failed");
+      }
+    },
+    async setSignals({ dataTerminalReady }) {
+      failedEvents.push(`dtr:${dataTerminalReady}`);
+      if (stage === "setSignals" && dataTerminalReady) {
+        throw new Error("setSignals failed after asserting DTR");
+      }
+    },
+    async close() {
+      failedEvents.push("close");
+    },
+  };
+  const healthy = fakeSerial();
+  const ports = [failedPort, healthy.port];
+
+  return {
+    serial: {
+      async requestPort() {
+        return ports.shift();
+      },
+    },
+    failedEvents,
+    healthy,
+  };
+}
+
 function gatedSerial() {
   const events = [];
   const writes = [];
@@ -355,6 +403,48 @@ test("connect asserts DTR and heartbeat writes no-response without pending", asy
 
   await client.disconnect();
 });
+
+for (const failure of [
+  {
+    stage: "open",
+    error: /open failed/,
+    expectedEvents: ["open"],
+  },
+  {
+    stage: "getWriter",
+    error: /getWriter failed/,
+    expectedEvents: ["open", "writer:get", "close"],
+  },
+  {
+    stage: "setSignals",
+    error: /setSignals failed after asserting DTR/,
+    expectedEvents: ["open", "writer:get", "dtr:true", "dtr:false", "writer:release", "close"],
+  },
+]) {
+  test(`connect rolls back when ${failure.stage} fails and permits a later connection`, async () => {
+    const serialState = serialWithInitializationFailure(failure.stage);
+    const timers = fakeTimers();
+    const client = makeClient(serialState, timers);
+
+    await assert.rejects(client.connect(), failure.error);
+    assert.equal(client.port, null);
+    assert.equal(client.writer, null);
+    assert.equal(client.reader, null);
+    assert.equal(client.connected, false);
+    assert.equal(client.heartbeatTimer, null);
+    assert.equal(client.readTask, null);
+    assert.equal(client.pending.size, 0);
+    assert.deepEqual(serialState.failedEvents, failure.expectedEvents);
+
+    await client.connect();
+    assert.equal(client.connected, true);
+    assert.equal(client.port, serialState.healthy.port);
+    await client.disconnect();
+    assert.equal(client.connected, false);
+    assert.equal(client.port, null);
+    assert.ok(serialState.healthy.events.includes("close"));
+  });
+}
 
 test("NACK is terminal and writes the request only once", async () => {
   const serialState = fakeSerial();
