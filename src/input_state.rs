@@ -378,6 +378,11 @@ mod tests {
 
         assert_eq!(state.keyboard.modifiers(), 0x02);
         assert_eq!(state.keyboard.keycodes(), &[0x1A]);
+
+        state.keyboard.key_up(stroke(0x02, 0));
+
+        assert_eq!(state.keyboard.modifiers(), 0);
+        assert_eq!(state.keyboard.keycodes(), &[0x1A]);
     }
 
     #[test]

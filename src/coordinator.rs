@@ -1086,7 +1086,57 @@ fn fingerprint(frame: &Frame<'_>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{CommandType, FLAG_NO_RESPONSE, Frame, MAX_PAYLOAD_SIZE, MAX_WAIT_MS};
+    use crate::protocol::{
+        CommandType, FLAG_NO_RESPONSE, Frame, MAX_PAYLOAD_SIZE, MAX_WAIT_MS, PROTOCOL_VERSION,
+    };
+    use crate::safety::{CONTROL_LEASE_MS, LeaseState};
+
+    struct LeaseRuntimeHarness {
+        runtime: RuntimeModel,
+        lease: LeaseState,
+        guarded_work: bool,
+        response_count: usize,
+    }
+
+    impl LeaseRuntimeHarness {
+        fn new() -> Self {
+            Self {
+                runtime: RuntimeModel::new(),
+                lease: LeaseState::new(CONTROL_LEASE_MS),
+                guarded_work: false,
+                response_count: 0,
+            }
+        }
+
+        fn receive_at(&mut self, now_ms: u64, frame: Frame<'_>) -> ModelEvent {
+            assert_eq!(frame.version, PROTOCOL_VERSION);
+            let event = self.runtime.accept(frame);
+            match &event {
+                ModelEvent::Start(_) => self.lease.refresh(now_ms),
+                ModelEvent::Respond(_) => self.response_count += 1,
+                _ => {}
+            }
+            event
+        }
+
+        fn hold_input_at(&mut self, now_ms: u64, frame: Frame<'_>) {
+            assert!(matches!(
+                self.receive_at(now_ms, frame),
+                ModelEvent::Start(_)
+            ));
+            self.guarded_work = true;
+            self.runtime.note_input_held(true);
+        }
+
+        fn poll_lease_at(&mut self, now_ms: u64) -> Option<ModelEvent> {
+            if !self.lease.should_release(now_ms, self.guarded_work) {
+                return None;
+            }
+
+            self.guarded_work = false;
+            Some(self.runtime.safety_event(SafetyEvent::LeaseExpired))
+        }
+    }
 
     fn request<'a>(
         version: u8,
@@ -1681,6 +1731,26 @@ mod tests {
         assert_eq!(
             coordinator.admit(&diagnostic),
             Admission::Replay(CachedResponse::ack(2, 46))
+        );
+    }
+
+    #[test]
+    fn sequence_zero_heartbeat_refreshes_guarded_lease_without_response() {
+        let mut harness = LeaseRuntimeHarness::new();
+        harness.hold_input_at(100, request(2, 47, CommandType::KeyDown, &[0, 0x1A]));
+        assert_eq!(harness.lease.deadline_ms(), Some(2_100));
+
+        let heartbeat = request_with_flags(2, FLAG_NO_RESPONSE, 0, CommandType::Heartbeat, &[]);
+        assert_eq!(harness.receive_at(1_500, heartbeat), ModelEvent::Start(0));
+        assert_eq!(harness.lease.deadline_ms(), Some(3_500));
+        assert_eq!(harness.response_count, 0);
+        assert!(!harness.runtime.has_cached_sequence(0));
+
+        assert_eq!(harness.poll_lease_at(2_100), None);
+        assert_eq!(harness.poll_lease_at(3_499), None);
+        assert_eq!(
+            harness.poll_lease_at(3_500),
+            Some(ModelEvent::CancelReleaseAndResetSession)
         );
     }
 
