@@ -28,6 +28,7 @@ mod owned_command;
 mod protocol;
 mod response_writer;
 mod runtime;
+mod runtime_safety;
 #[allow(dead_code)]
 mod safety;
 mod static_resources;

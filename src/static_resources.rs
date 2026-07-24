@@ -9,6 +9,7 @@ use static_cell::StaticCell;
 
 use crate::coordinator::{CachedResponse, OwnedRequest, SafetyEvent};
 use crate::runtime::{ExecutionJob, ExecutionResult};
+use crate::runtime_safety::LeaseRefresh;
 use crate::usb_device::{KeyboardLedHandler, UsbHidState};
 use crate::usb_identity::USB_SERIAL_CAPACITY;
 
@@ -18,7 +19,7 @@ pub static RESULTS: Channel<CriticalSectionRawMutex, ExecutionResult, 2> = Chann
 pub static RESPONSES: Channel<CriticalSectionRawMutex, CachedResponse, 8> = Channel::new();
 pub static SAFETY_EVENTS: Channel<CriticalSectionRawMutex, SafetyEvent, 4> = Channel::new();
 pub static CANCEL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
-pub static LEASE_REFRESH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+pub static LEASE_REFRESH: Signal<CriticalSectionRawMutex, LeaseRefresh> = Signal::new();
 pub static REQUEST_RESET: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static RESPONSE_RESET: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 

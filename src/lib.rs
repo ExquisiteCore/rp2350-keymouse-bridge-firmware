@@ -11,6 +11,7 @@ pub mod input_state;
 pub mod led;
 pub mod owned_command;
 pub mod protocol;
+pub mod runtime_safety;
 pub mod safety;
 pub mod usb_identity;
 

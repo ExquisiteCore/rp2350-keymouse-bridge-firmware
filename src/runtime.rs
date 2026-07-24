@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_futures::select::{Either, Either3, select, select3};
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 use embassy_usb::class::hid::ReadError;
 use embassy_usb::driver::EndpointError;
 use heapless::Vec;
@@ -21,7 +21,8 @@ use crate::error::ErrorCode;
 use crate::execution_core::{BatchExecutionBackend, execute_batch};
 use crate::firmware_config::{capability_payload, info_payload};
 use crate::frame_stream::{
-    FrameAction, append_packet_chunk, next_frame_action, sequence_from_partial, shift_left,
+    FrameAction, PartialFrameTimeout, append_packet_chunk, next_frame_action,
+    sequence_from_partial, shift_left,
 };
 use crate::led::{LedMode, LedSignal};
 use crate::owned_command::OwnedCommand;
@@ -30,6 +31,9 @@ use crate::protocol::{
     PROTOCOL_VERSION, decode_frame,
 };
 use crate::response_writer::send_cached_response;
+use crate::runtime_safety::{
+    RuntimeLease, RuntimeSafetyAction, admit_runtime_request, runtime_safety_action,
+};
 use crate::safety::{CONTROL_LEASE_MS, CancellationGeneration, PARTIAL_FRAME_TIMEOUT_MS};
 use crate::static_resources::{
     CANCEL, JOBS, LEASE_REFRESH, REQUEST_RESET, REQUESTS, RESPONSE_RESET, RESPONSES, RESULTS,
@@ -86,25 +90,26 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
         receiver.wait_connection().await;
         crate::set_led_mode(LedMode::Connected);
         let mut frame_len = 0usize;
+        let mut partial_timeout = PartialFrameTimeout::new(PARTIAL_FRAME_TIMEOUT_MS);
         let mut buffered_session = current_session_generation();
 
         loop {
             let current_session = current_session_generation();
             if !receiver.dtr() || APPLIED_SESSION.load(Ordering::Acquire) != current_session {
-                frame_len = 0;
+                partial_timeout.reset(&mut frame_len);
                 buffered_session = current_session;
                 let _ = REQUEST_RESET.wait().await;
                 continue;
             }
             let runtime_session = current_session;
             if runtime_session != buffered_session {
-                frame_len = 0;
+                partial_timeout.reset(&mut frame_len);
                 buffered_session = runtime_session;
             }
             let read_result = if frame_len == 0 {
                 match select(REQUEST_RESET.wait(), receiver.read_packet(&mut packet)).await {
                     Either::First(_) => {
-                        frame_len = 0;
+                        partial_timeout.reset(&mut frame_len);
                         buffered_session = current_session_generation();
                         continue;
                     }
@@ -115,19 +120,23 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
                     REQUEST_RESET.wait(),
                     select(
                         receiver.read_packet(&mut packet),
-                        Timer::after_millis(PARTIAL_FRAME_TIMEOUT_MS),
+                        Timer::after_millis(
+                            partial_timeout
+                                .remaining_ms(Instant::now().as_millis())
+                                .unwrap_or(PARTIAL_FRAME_TIMEOUT_MS),
+                        ),
                     ),
                 )
                 .await
                 {
                     Either::First(_) => {
-                        frame_len = 0;
+                        partial_timeout.reset(&mut frame_len);
                         buffered_session = current_session_generation();
                         continue;
                     }
                     Either::Second(Either::First(result)) => result,
                     Either::Second(Either::Second(())) => {
-                        frame_len = 0;
+                        let _ = partial_timeout.expire(Instant::now().as_millis(), &mut frame_len);
                         continue;
                     }
                 }
@@ -142,7 +151,7 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
                 }
                 Err(EndpointError::BufferOverflow) => {
                     crate::signal_led(LedSignal::Error);
-                    frame_len = 0;
+                    partial_timeout.reset(&mut frame_len);
                     if receiver.dtr() {
                         queue_response_for_session(
                             CachedResponse::nack(PROTOCOL_VERSION, 0, ErrorCode::Transport),
@@ -154,7 +163,7 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
             };
 
             if !receiver.dtr() {
-                frame_len = 0;
+                partial_timeout.reset(&mut frame_len);
                 continue;
             }
             if read_len == 0 {
@@ -170,12 +179,13 @@ pub async fn cdc_receive_task(mut receiver: CdcReceiver) -> ! {
                 );
                 debug_assert!(copied > 0);
                 if copied == 0 {
-                    frame_len = 0;
+                    partial_timeout.reset(&mut frame_len);
                     break;
                 }
                 drain_frames(&mut frame_buf, &mut frame_len, runtime_session).await;
+                partial_timeout.note_progress(Instant::now().as_millis(), frame_len);
                 if current_session_generation() != runtime_session || !receiver.dtr() {
-                    frame_len = 0;
+                    partial_timeout.reset(&mut frame_len);
                     break;
                 }
             }
@@ -262,25 +272,16 @@ pub async fn dispatcher_task() -> ! {
                 let version = request.version();
                 let sequence = request.sequence();
                 let command_type = request.command_type();
-                let admission =
-                    coordinator.admit_prepared_with_external_busy(request, emergency_in_flight);
-                // Legacy v1 controllers do not advertise/send heartbeats; arming their lease would
-                // unexpectedly release intentional held input after two seconds.
-                if version == PROTOCOL_VERSION
-                    && !matches!(
-                        &admission,
-                        Admission::Reject(
-                            ErrorCode::BadCommand
-                                | ErrorCode::FrameTooLong
-                                | ErrorCode::UnsupportedVersion
-                                | ErrorCode::UnsupportedFlags
-                                | ErrorCode::InvalidSequence
-                                | ErrorCode::WaitTooLong
-                        )
-                    )
-                {
-                    LEASE_REFRESH.signal(());
+                let runtime_admission = admit_runtime_request(
+                    &mut coordinator,
+                    request,
+                    emergency_in_flight,
+                    Instant::now().as_millis(),
+                );
+                if let Some(refresh) = runtime_admission.lease_refresh() {
+                    LEASE_REFRESH.signal(refresh);
                 }
+                let admission = runtime_admission.into_admission();
 
                 match admission {
                     Admission::Execute(request) => {
@@ -759,8 +760,11 @@ pub async fn cdc_control_task(control: CdcControl) -> ! {
         let dtr = control.dtr();
         DTR_ASSERTED.store(dtr, Ordering::Release);
         if previous_dtr && !dtr {
-            begin_session_reset();
-            SAFETY_EVENTS.send(SafetyEvent::DtrLost).await;
+            apply_runtime_safety_action(
+                SafetyEvent::DtrLost,
+                runtime_safety_action(SafetyEvent::DtrLost),
+            )
+            .await;
         } else if !previous_dtr
             && dtr
             && APPLIED_SESSION.load(Ordering::Acquire) == current_session_generation()
@@ -773,20 +777,37 @@ pub async fn cdc_control_task(control: CdcControl) -> ! {
 
 #[embassy_executor::task]
 pub async fn lease_task() -> ! {
+    let mut lease = RuntimeLease::new(CONTROL_LEASE_MS);
     loop {
-        LEASE_REFRESH.wait().await;
+        lease.observe(LEASE_REFRESH.wait().await);
         loop {
-            match select(Timer::after_millis(CONTROL_LEASE_MS), LEASE_REFRESH.wait()).await {
+            let remaining_ms = lease
+                .remaining_ms(Instant::now().as_millis())
+                .unwrap_or(CONTROL_LEASE_MS);
+            match select(Timer::after_millis(remaining_ms), LEASE_REFRESH.wait()).await {
                 Either::First(()) => {
-                    if GUARDED_WORK.load(Ordering::Acquire) {
-                        begin_session_reset();
-                        SAFETY_EVENTS.send(SafetyEvent::LeaseExpired).await;
+                    if let Some(action) = lease.poll(
+                        Instant::now().as_millis(),
+                        GUARDED_WORK.load(Ordering::Acquire),
+                    ) {
+                        apply_runtime_safety_action(SafetyEvent::LeaseExpired, action).await;
                     }
-                    break;
+                    if !lease.is_armed() {
+                        break;
+                    }
                 }
-                Either::Second(()) => {}
+                Either::Second(refresh) => lease.observe(refresh),
             }
         }
+    }
+}
+
+async fn apply_runtime_safety_action(event: SafetyEvent, action: RuntimeSafetyAction) {
+    if action.clear_session() {
+        begin_session_reset();
+    }
+    if action.release_inputs() {
+        SAFETY_EVENTS.send(event).await;
     }
 }
 

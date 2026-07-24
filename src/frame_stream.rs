@@ -66,6 +66,51 @@ pub fn clear_expired_partial(
     true
 }
 
+/// Pure partial-frame timer state shared by the receiver task and host tests.
+pub struct PartialFrameTimeout {
+    deadline: PartialFrameDeadline,
+}
+
+impl PartialFrameTimeout {
+    /// Creates an inactive timeout with a fixed duration.
+    pub const fn new(timeout_ms: u64) -> Self {
+        Self {
+            deadline: PartialFrameDeadline::new(timeout_ms),
+        }
+    }
+
+    /// Records receive-side progress and arms or disarms the timeout from buffer length.
+    pub fn note_progress(&mut self, now_ms: u64, unconsumed_len: usize) {
+        self.deadline.note_bytes(now_ms, unconsumed_len);
+    }
+
+    /// Applies a timer firing to the authoritative buffered length.
+    pub fn expire(&mut self, now_ms: u64, len: &mut usize) -> bool {
+        clear_expired_partial(len, &mut self.deadline, now_ms)
+    }
+
+    /// Clears buffered partial data after a transport or session reset.
+    pub fn reset(&mut self, len: &mut usize) {
+        *len = 0;
+        self.deadline.clear();
+    }
+
+    /// Reports whether partial data currently owns a timeout.
+    pub const fn is_active(&self) -> bool {
+        self.deadline.is_active()
+    }
+
+    /// Returns milliseconds until expiry, clamped to zero once reached.
+    pub fn remaining_ms(&self, now_ms: u64) -> Option<u64> {
+        let deadline_ms = self.deadline.deadline_ms()?;
+        if self.deadline.expired(now_ms) {
+            Some(0)
+        } else {
+            Some(deadline_ms.wrapping_sub(now_ms))
+        }
+    }
+}
+
 pub fn sequence_from_partial(data: &[u8]) -> u16 {
     if data.len() >= 6 {
         u16::from_be_bytes([data[4], data[5]])
@@ -173,18 +218,18 @@ mod tests {
         let mut buf = [0u8; MAX_FRAME_SIZE];
         buf[..4].copy_from_slice(&[MAGIC[0], MAGIC[1], 1, 0]);
         let mut len = 4;
-        let mut deadline = PartialFrameDeadline::new(PARTIAL_FRAME_TIMEOUT_MS);
-        deadline.note_bytes(1_000, len);
+        let mut timeout = PartialFrameTimeout::new(PARTIAL_FRAME_TIMEOUT_MS);
+        timeout.note_progress(1_000, len);
 
         assert_eq!(next_frame_action(&buf[..len]), Some(FrameAction::NeedMore));
-        assert!(!clear_expired_partial(&mut len, &mut deadline, 1_249));
+        assert!(!timeout.expire(1_249, &mut len));
         assert_eq!(len, 4);
-        assert!(clear_expired_partial(&mut len, &mut deadline, 1_250));
+        assert!(timeout.expire(1_250, &mut len));
         assert_eq!(len, 0);
-        assert!(!deadline.is_active());
+        assert!(!timeout.is_active());
 
         len = encode_frame(1, 7, CommandType::Ping, &[], &mut buf).unwrap();
-        deadline.note_bytes(1_300, len);
+        timeout.note_progress(1_300, len);
         assert_eq!(
             next_frame_action(&buf[..len]),
             Some(FrameAction::Process(len))
@@ -192,9 +237,9 @@ mod tests {
 
         let consumed = len;
         shift_left(&mut buf, &mut len, consumed);
-        deadline.note_bytes(1_300, len);
+        timeout.note_progress(1_300, len);
         assert_eq!(len, 0);
-        assert!(!deadline.is_active());
+        assert!(!timeout.is_active());
     }
 
     #[test]
