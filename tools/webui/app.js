@@ -69,6 +69,7 @@ export class SerialHidClient {
     this.lifecycleQueue = Promise.resolve();
     this.disconnectTask = null;
     this.generation = 0;
+    this.portGenerations = new WeakMap();
   }
 
   connect() {
@@ -108,6 +109,7 @@ export class SerialHidClient {
       this.heartbeatTimer = null;
       this.batchDurationMs = null;
       this.connected = true;
+      this.portGenerations.set(port, generation);
       this.startHeartbeat(generation, writer, port);
       const pending = this.pending;
       this.readTask = this.readLoop(generation, port, pending);
@@ -142,6 +144,24 @@ export class SerialHidClient {
       && this.generation === generation
       && this.writer === writer
       && this.port === port;
+  }
+
+  sessionSnapshot(port = this.port) {
+    if (!this.connected
+      || port !== this.port
+      || this.portGenerations.get(port) !== this.generation) {
+      return null;
+    }
+    return Object.freeze({ port, generation: this.generation });
+  }
+
+  matchesSession(expectedSession) {
+    return expectedSession !== null
+      && expectedSession !== undefined
+      && this.connected
+      && expectedSession.port === this.port
+      && expectedSession.generation === this.generation
+      && this.portGenerations.get(expectedSession.port) === expectedSession.generation;
   }
 
   startHeartbeat(generation = this.generation, writer = this.writer, port = this.port) {
@@ -228,7 +248,10 @@ export class SerialHidClient {
     return null;
   }
 
-  disconnect() {
+  disconnect(expectedSession = null) {
+    if (expectedSession !== null && !this.matchesSession(expectedSession)) {
+      return Promise.resolve(false);
+    }
     if (this.disconnectTask) {
       return this.disconnectTask;
     }
@@ -238,7 +261,9 @@ export class SerialHidClient {
       const session = captured ?? this.detachSession();
       if (session) {
         await this.cleanupSession(session);
+        return true;
       }
+      return false;
     });
     const task = transition.finally(() => {
       if (this.disconnectTask === task) {
@@ -273,6 +298,10 @@ export class SerialHidClient {
     const heartbeatTimer = this.heartbeatTimer;
     const pending = this.pending;
     const generation = this.generation;
+
+    if (port && this.portGenerations.get(port) === generation) {
+      this.portGenerations.delete(port);
+    }
 
     this.connected = false;
     this.generation += 1;
@@ -312,17 +341,13 @@ export class SerialHidClient {
     }
 
     if (reader) {
-      try {
-        await reader.cancel();
-      } catch {}
+      await this.awaitCleanup(Promise.resolve().then(() => reader.cancel()));
     }
     if (readTask) {
       await this.awaitCleanup(readTask);
     }
     if (port) {
-      try {
-        await port.setSignals({ dataTerminalReady: false });
-      } catch {}
+      await this.awaitCleanup(Promise.resolve().then(() => port.setSignals({ dataTerminalReady: false })));
     }
     if (writer) {
       try {
@@ -330,9 +355,7 @@ export class SerialHidClient {
       } catch {}
     }
     if (port) {
-      try {
-        await port.close();
-      } catch {}
+      await this.awaitCleanup(Promise.resolve().then(() => port.close()));
     }
   }
 
@@ -591,14 +614,18 @@ export class SerialHidClient {
   }
 }
 
-export async function handlePhysicalDisconnect(client, setConnectedCallback, log) {
+export async function handlePhysicalDisconnect(client, expectedSession, setConnectedCallback, log) {
   try {
-    await client.disconnect();
-  } catch (error) {
-    log("error", "DETACH", error.message);
-  } finally {
+    const disconnected = await client.disconnect(expectedSession);
+    if (!disconnected) {
+      return false;
+    }
     setConnectedCallback(false);
     log("info", "DETACH", "serial device removed");
+    return true;
+  } catch (error) {
+    log("error", "DETACH", error.message);
+    return false;
   }
 }
 
@@ -646,8 +673,14 @@ $$("[data-click]").forEach((button) => {
   button.addEventListener("click", () => sendMouseClick(button.dataset.click));
 });
 
-navigator.serial?.addEventListener("disconnect", () => {
-  void handlePhysicalDisconnect(client, setConnected, addLog);
+navigator.serial?.addEventListener("disconnect", (event) => {
+  // SerialConnectionEvent identifies only the port. Explicit saved tokens reject
+  // old generations, but the browser cannot tag a delayed event when one port
+  // object is disconnected and then reused for a newer session.
+  const expectedSession = client.sessionSnapshot(event.port);
+  if (expectedSession) {
+    void handlePhysicalDisconnect(client, expectedSession, setConnected, addLog);
+  }
 });
 
 setConnected(false);

@@ -289,10 +289,69 @@ function hungSerial() {
   };
 }
 
+function serialWithHungCleanup(stage) {
+  const events = [];
+  const never = new Promise(() => {});
+  let finishRead = null;
+  const reader = {
+    read() {
+      return new Promise((resolve) => {
+        finishRead = resolve;
+      });
+    },
+    cancel() {
+      events.push("reader:cancel");
+      finishRead?.({ value: undefined, done: true });
+      return stage === "cancel" ? never : Promise.resolve();
+    },
+    releaseLock() {
+      events.push("reader:release");
+    },
+  };
+  const writer = {
+    async write(frame) {
+      events.push(`write:${decodeFrame(frame).commandType}`);
+    },
+    releaseLock() {
+      events.push("writer:release");
+    },
+  };
+  const port = {
+    readable: { getReader: () => reader },
+    writable: { getWriter: () => writer },
+    async open() {
+      events.push("open");
+    },
+    setSignals({ dataTerminalReady }) {
+      events.push(`dtr:${dataTerminalReady}`);
+      return stage === "dtr" && !dataTerminalReady ? never : Promise.resolve();
+    },
+    close() {
+      events.push("close");
+      return stage === "close" ? never : Promise.resolve();
+    },
+  };
+  return {
+    serial: { requestPort: async () => port },
+    port,
+    events,
+  };
+}
+
 async function flushMicrotasks() {
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 40; index += 1) {
     await Promise.resolve();
   }
+}
+
+async function flushUntil(predicate) {
+  for (let index = 0; index < 40; index += 1) {
+    if (predicate()) {
+      return;
+    }
+    await Promise.resolve();
+  }
+  assert.fail("condition did not become true while flushing microtasks");
 }
 
 function responseFrame(sequence, commandType, payload = new Uint8Array()) {
@@ -665,17 +724,19 @@ test("concurrent manual and physical disconnects share one cleanup", async () =>
   const request = client.send(CommandType.Ping);
   const rejectedRequest = assert.rejects(request, /serial disconnected/);
   await serialState.firstWriteStarted;
+  const expectedSession = client.sessionSnapshot();
 
   let firstSettled = false;
   let secondSettled = false;
   let physicalSettled = false;
-  const first = client.disconnect().then(() => { firstSettled = true; });
-  const second = client.disconnect().then(() => { secondSettled = true; });
   const physical = handlePhysicalDisconnect(
     client,
+    expectedSession,
     (connected) => ui.push(`connected:${connected}`),
     (level, label, message) => ui.push(`${level}:${label}:${message}`),
   ).then(() => { physicalSettled = true; });
+  const first = client.disconnect().then(() => { firstSettled = true; });
+  const second = client.disconnect().then(() => { secondSettled = true; });
   await rejectedRequest;
   await flushMicrotasks();
 
@@ -755,6 +816,116 @@ test("reconnect waits for old cleanup and stale callbacks cannot affect the new 
   assert.equal(second.events.filter((event) => event === "close").length, 1);
 });
 
+test("physical disconnect ignores stale and unrelated port session tokens", async () => {
+  const first = fakeSerial();
+  const second = fakeSerial();
+  const ports = [first.port, second.port];
+  const timers = fakeTimers();
+  const client = makeClient({
+    serial: { requestPort: async () => ports.shift() },
+  }, timers);
+  const ui = [];
+
+  await client.connect();
+  const firstSession = client.sessionSnapshot();
+  await client.disconnect();
+  await client.connect();
+  const secondSession = client.sessionSnapshot();
+  const unrelatedSession = { port: {}, generation: secondSession.generation };
+
+  assert.equal(await handlePhysicalDisconnect(
+    client,
+    firstSession,
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  ), false);
+  assert.equal(await handlePhysicalDisconnect(
+    client,
+    unrelatedSession,
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  ), false);
+
+  assert.equal(client.connected, true);
+  assert.equal(client.port, second.port);
+  assert.equal(second.events.filter((event) => event === "writer:release").length, 0);
+  assert.equal(second.events.filter((event) => event === "close").length, 0);
+  assert.deepEqual(ui, []);
+
+  assert.equal(await handlePhysicalDisconnect(
+    client,
+    secondSession,
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  ), true);
+  assert.equal(second.events.filter((event) => event === "writer:release").length, 1);
+  assert.equal(second.events.filter((event) => event === "close").length, 1);
+  assert.deepEqual(ui.slice(-2), ["connected:false", "info:DETACH:serial device removed"]);
+});
+
+test("physical disconnect rejects an old generation for the same SerialPort", async () => {
+  const shared = fakeSerial();
+  const timers = fakeTimers();
+  const client = makeClient(shared, timers);
+  const ui = [];
+
+  await client.connect();
+  const oldSession = client.sessionSnapshot();
+  await client.disconnect();
+  await client.connect();
+  const currentSession = client.sessionSnapshot();
+  assert.equal(oldSession.port, currentSession.port);
+  assert.notEqual(oldSession.generation, currentSession.generation);
+  const closeCount = shared.events.filter((event) => event === "close").length;
+
+  assert.equal(await handlePhysicalDisconnect(
+    client,
+    oldSession,
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  ), false);
+  assert.equal(client.connected, true);
+  assert.equal(shared.events.filter((event) => event === "close").length, closeCount);
+  assert.deepEqual(ui, []);
+
+  assert.equal(await handlePhysicalDisconnect(
+    client,
+    currentSession,
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  ), true);
+  assert.equal(shared.events.filter((event) => event === "close").length, closeCount + 1);
+  assert.deepEqual(ui.slice(-2), ["connected:false", "info:DETACH:serial device removed"]);
+});
+
+for (const stage of ["cancel", "dtr", "close"]) {
+  test(`disconnect bounds a hung ${stage} cleanup step and continues`, async () => {
+    const serialState = serialWithHungCleanup(stage);
+    const timers = fakeTimers(serialState.events);
+    const client = makeClient(serialState, timers, { cleanupTimeoutMs: 25 });
+    await client.connect();
+
+    let settled = false;
+    const disconnect = client.disconnect().then(() => { settled = true; });
+    const hungEvent = {
+      cancel: "reader:cancel",
+      dtr: "dtr:false",
+      close: "close",
+    }[stage];
+    await flushUntil(() => serialState.events.includes(hungEvent));
+    assert.equal(settled, false);
+    assert.ok(timers.delays().includes(25));
+
+    timers.runTimeout(25);
+    await disconnect;
+    assert.equal(settled, true);
+    assert.ok(serialState.events.includes("reader:cancel"));
+    assert.ok(serialState.events.includes("dtr:false"));
+    assert.ok(serialState.events.includes("writer:release"));
+    assert.ok(serialState.events.includes("close"));
+  });
+}
+
 test("physical disconnect fully closes the session and stale timeout cannot retry after reconnect", async () => {
   const first = fakeSerial({ readable: true });
   const second = fakeSerial();
@@ -766,8 +937,10 @@ test("physical disconnect fully closes the session and stale timeout cannot retr
   const request = client.send(CommandType.Ping);
   await flushMicrotasks();
   const staleTimeout = timers.callbackFor(1000);
+  const expectedSession = client.sessionSnapshot();
   const detach = handlePhysicalDisconnect(
     client,
+    expectedSession,
     (connected) => ui.push(`connected:${connected}`),
     (level, label, message) => ui.push(`${level}:${label}:${message}`),
   );
@@ -790,19 +963,18 @@ test("physical disconnect fully closes the session and stale timeout cannot retr
   await client.disconnect();
 });
 
-test("physical disconnect still closes the UI when cleanup throws", async () => {
+test("physical disconnect reports cleanup failure without falsely closing the UI", async () => {
   const ui = [];
 
-  await handlePhysicalDisconnect(
+  assert.equal(await handlePhysicalDisconnect(
     { disconnect: async () => { throw new Error("cleanup failed"); } },
+    { port: {}, generation: 1 },
     (connected) => ui.push(`connected:${connected}`),
     (level, label, message) => ui.push(`${level}:${label}:${message}`),
-  );
+  ), false);
 
   assert.deepEqual(ui, [
     "error:DETACH:cleanup failed",
-    "connected:false",
-    "info:DETACH:serial device removed",
   ]);
 });
 
