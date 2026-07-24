@@ -32,7 +32,8 @@ use crate::protocol::{
 };
 use crate::response_writer::send_cached_response;
 use crate::runtime_safety::{
-    RuntimeLease, RuntimeSafetyAction, admit_runtime_request, runtime_safety_action,
+    RuntimeLease, RuntimeSafetyAction, RuntimeSafetyStep, admit_runtime_request,
+    latest_lease_refresh, runtime_safety_action,
 };
 use crate::safety::{CONTROL_LEASE_MS, CancellationGeneration, PARTIAL_FRAME_TIMEOUT_MS};
 use crate::static_resources::{
@@ -266,7 +267,8 @@ pub async fn dispatcher_task() -> ! {
         .await
         {
             Either3::Third(request) => {
-                if request.runtime_session() != current_session_generation() {
+                let runtime_session = current_session_generation();
+                if request.runtime_session() != runtime_session {
                     continue;
                 }
                 let version = request.version();
@@ -276,6 +278,7 @@ pub async fn dispatcher_task() -> ! {
                     &mut coordinator,
                     request,
                     emergency_in_flight,
+                    runtime_session,
                     Instant::now().as_millis(),
                 );
                 if let Some(refresh) = runtime_admission.lease_refresh() {
@@ -779,35 +782,72 @@ pub async fn cdc_control_task(control: CdcControl) -> ! {
 pub async fn lease_task() -> ! {
     let mut lease = RuntimeLease::new(CONTROL_LEASE_MS);
     loop {
-        lease.observe(LEASE_REFRESH.wait().await);
-        loop {
+        let selected = LEASE_REFRESH.wait().await;
+        let refresh = latest_lease_refresh(selected, LEASE_REFRESH.try_take());
+        if let Some(action) = lease.transition(
+            current_session_generation(),
+            Instant::now().as_millis(),
+            GUARDED_WORK.load(Ordering::Acquire),
+            Some(refresh),
+        ) {
+            apply_runtime_safety_action(SafetyEvent::LeaseExpired, action).await;
+        }
+
+        while lease.is_armed() {
+            if let Some(refresh) = LEASE_REFRESH.try_take() {
+                if let Some(action) = lease.transition(
+                    current_session_generation(),
+                    Instant::now().as_millis(),
+                    GUARDED_WORK.load(Ordering::Acquire),
+                    Some(refresh),
+                ) {
+                    apply_runtime_safety_action(SafetyEvent::LeaseExpired, action).await;
+                }
+                continue;
+            }
+
+            if let Some(action) = lease.transition(
+                current_session_generation(),
+                Instant::now().as_millis(),
+                GUARDED_WORK.load(Ordering::Acquire),
+                None,
+            ) {
+                apply_runtime_safety_action(SafetyEvent::LeaseExpired, action).await;
+            }
+            if !lease.is_armed() {
+                break;
+            }
+
             let remaining_ms = lease
                 .remaining_ms(Instant::now().as_millis())
                 .unwrap_or(CONTROL_LEASE_MS);
-            match select(Timer::after_millis(remaining_ms), LEASE_REFRESH.wait()).await {
-                Either::First(()) => {
-                    if let Some(action) = lease.poll(
-                        Instant::now().as_millis(),
-                        GUARDED_WORK.load(Ordering::Acquire),
-                    ) {
-                        apply_runtime_safety_action(SafetyEvent::LeaseExpired, action).await;
+            let pending_refresh =
+                match select(Timer::after_millis(remaining_ms), LEASE_REFRESH.wait()).await {
+                    Either::First(()) => LEASE_REFRESH.try_take(),
+                    Either::Second(selected) => {
+                        Some(latest_lease_refresh(selected, LEASE_REFRESH.try_take()))
                     }
-                    if !lease.is_armed() {
-                        break;
-                    }
-                }
-                Either::Second(refresh) => lease.observe(refresh),
+                };
+            if let Some(action) = lease.transition(
+                current_session_generation(),
+                Instant::now().as_millis(),
+                GUARDED_WORK.load(Ordering::Acquire),
+                pending_refresh,
+            ) {
+                apply_runtime_safety_action(SafetyEvent::LeaseExpired, action).await;
             }
         }
     }
 }
 
 async fn apply_runtime_safety_action(event: SafetyEvent, action: RuntimeSafetyAction) {
-    if action.clear_session() {
-        begin_session_reset();
-    }
-    if action.release_inputs() {
-        SAFETY_EVENTS.send(event).await;
+    for step in action.steps() {
+        match step {
+            RuntimeSafetyStep::ResetSession => {
+                begin_session_reset();
+            }
+            RuntimeSafetyStep::ReleaseInputs => SAFETY_EVENTS.send(event).await,
+        }
     }
 }
 
