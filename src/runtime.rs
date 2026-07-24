@@ -10,13 +10,15 @@ use heapless::Vec;
 
 use crate::batch::{BatchCollector, BatchError};
 use crate::command_executor::{
-    CancelWait, DeviceResponse, InputState, execute_frame_with_cancel, reset_inputs,
+    CancelWait, DeviceResponse, InputState, execute_frame_in_batch, execute_frame_with_cancel,
+    reset_inputs,
 };
 use crate::coordinator::{
     Admission, CachedResponse, CompletionToken, Coordinator, OwnedRequest, OwnedRequestBody,
     RESPONSE_CACHE_SIZE, SafetyEvent, advance_session_generation,
 };
 use crate::error::ErrorCode;
+use crate::execution_core::{BatchExecutionBackend, execute_batch};
 use crate::firmware_config::{capability_payload, info_payload};
 use crate::frame_stream::{
     FrameAction, append_packet_chunk, next_frame_action, sequence_from_partial, shift_left,
@@ -473,25 +475,17 @@ pub async fn executor_task(mut keyboard: KeyboardWriter, mut mouse: MouseWriter)
                     .completion_token()
                     .expect("batch end must carry a completion token");
                 let mut cancel = CancelWait::new(&CANCEL, baseline_generation);
-                let mut result = Ok(DeviceResponse::Ack);
-                for command in batch.commands() {
-                    result = execute_owned_command(
-                        request.version(),
-                        request.sequence(),
-                        command,
-                        &mut keyboard,
-                        &mut mouse,
-                        &mut input_state,
-                        &mut cancel,
-                    )
-                    .await;
-                    if result.is_err() {
-                        break;
-                    }
-                }
-                if result.is_err() {
-                    let _ = reset_inputs(&mut keyboard, &mut mouse, &mut input_state).await;
-                }
+                let result = {
+                    let mut backend = RuntimeBatchExecutionBackend {
+                        version: request.version(),
+                        sequence: request.sequence(),
+                        keyboard: &mut keyboard,
+                        mouse: &mut mouse,
+                        input_state: &mut input_state,
+                        cancel: &mut cancel,
+                    };
+                    execute_batch(batch.commands(), &mut backend).await
+                };
                 RESULTS
                     .send(ExecutionResult::Command {
                         token,
@@ -542,6 +536,30 @@ async fn execute_owned_command(
     input_state: &mut InputState,
     cancel: &mut CancelWait<'_>,
 ) -> Result<DeviceResponse, ErrorCode> {
+    execute_owned_command_with_recovery(
+        version,
+        sequence,
+        command,
+        keyboard,
+        mouse,
+        input_state,
+        cancel,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_owned_command_with_recovery(
+    version: u8,
+    sequence: u16,
+    command: &OwnedCommand,
+    keyboard: &mut KeyboardWriter,
+    mouse: &mut MouseWriter,
+    input_state: &mut InputState,
+    cancel: &mut CancelWait<'_>,
+    recover: bool,
+) -> Result<DeviceResponse, ErrorCode> {
     let mut payload = [0u8; MAX_PAYLOAD_SIZE];
     let (command_type, payload_len) = encode_owned_command(command, &mut payload);
     let frame = Frame {
@@ -551,7 +569,40 @@ async fn execute_owned_command(
         command_type,
         payload: &payload[..payload_len],
     };
-    execute_frame_with_cancel(&frame, keyboard, mouse, input_state, cancel).await
+    if recover {
+        execute_frame_with_cancel(&frame, keyboard, mouse, input_state, cancel).await
+    } else {
+        execute_frame_in_batch(&frame, keyboard, mouse, input_state, cancel).await
+    }
+}
+
+struct RuntimeBatchExecutionBackend<'resources, 'signal> {
+    version: u8,
+    sequence: u16,
+    keyboard: &'resources mut KeyboardWriter,
+    mouse: &'resources mut MouseWriter,
+    input_state: &'resources mut InputState,
+    cancel: &'resources mut CancelWait<'signal>,
+}
+
+impl BatchExecutionBackend for RuntimeBatchExecutionBackend<'_, '_> {
+    async fn execute(&mut self, command: &OwnedCommand) -> Result<DeviceResponse, ErrorCode> {
+        execute_owned_command_with_recovery(
+            self.version,
+            self.sequence,
+            command,
+            self.keyboard,
+            self.mouse,
+            self.input_state,
+            self.cancel,
+            false,
+        )
+        .await
+    }
+
+    async fn reset_inputs(&mut self) {
+        let _ = reset_inputs(self.keyboard, self.mouse, self.input_state).await;
+    }
 }
 
 fn encode_owned_command(

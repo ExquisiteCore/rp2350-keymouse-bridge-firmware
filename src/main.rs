@@ -16,6 +16,7 @@ mod commands;
 #[allow(dead_code)]
 mod coordinator;
 mod error;
+mod execution_core;
 mod firmware_config;
 #[allow(dead_code)]
 mod frame_stream;
