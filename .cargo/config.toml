@@ -18,7 +18,7 @@ rustflags = [
     "-C", "target-cpu=cortex-m33",
 ]
 
-runner = "${PICOTOOL_PATH} load -u -v -x -t elf"
+runner = "powershell -NoProfile -ExecutionPolicy Bypass -File tools/flash.ps1"
 #runner = "probe-rs run --chip ${CHIP} --protocol swd"
 
 [env]
