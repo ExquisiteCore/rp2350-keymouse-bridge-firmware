@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LockResult, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -105,7 +105,7 @@ struct HeartbeatWorker {
 
 impl HeartbeatWorker {
     fn request_stop(&self) {
-        let mut stopped = self.stop.0.lock().unwrap();
+        let mut stopped = lock_recover(self.stop.0.lock());
         *stopped = true;
         self.stop.1.notify_all();
     }
@@ -278,7 +278,7 @@ impl HidClient {
 
     fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
         let write_mutex = Arc::clone(&self.write_mutex);
-        let _guard = write_mutex.lock().unwrap();
+        let _guard = lock_recover(write_mutex.lock());
         self.port.write_all(frame)?;
         self.port.flush()?;
         Ok(())
@@ -410,8 +410,8 @@ fn write_heartbeat_if_running(
     port: &mut dyn ClientPort,
     frame: &[u8],
 ) -> bool {
-    let _guard = write_mutex.lock().unwrap();
-    if *stop.0.lock().unwrap() {
+    let _guard = lock_recover(write_mutex.lock());
+    if *lock_recover(stop.0.lock()) {
         return false;
     }
     let _ = port.write_all(frame);
@@ -420,16 +420,20 @@ fn write_heartbeat_if_running(
 }
 
 fn wait_for_heartbeat_tick(stop: &(Mutex<bool>, Condvar), interval: Duration) -> bool {
-    let stopped = stop.0.lock().unwrap();
+    let stopped = lock_recover(stop.0.lock());
     if *stopped {
         return false;
     }
 
-    let (stopped, wait) = stop
-        .1
-        .wait_timeout_while(stopped, interval, |stopped| !*stopped)
-        .unwrap();
+    let (stopped, wait) = lock_recover(
+        stop.1
+            .wait_timeout_while(stopped, interval, |stopped| !*stopped),
+    );
     !*stopped && wait.timed_out()
+}
+
+fn lock_recover<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(PoisonError::into_inner)
 }
 
 fn busy_retry_delay(payload: &[u8]) -> Result<Duration> {
@@ -827,6 +831,74 @@ mod tests {
         drop(client);
 
         assert!(started.elapsed() < Duration::from_millis(100));
+        let state = state.0.lock().unwrap();
+        assert_eq!(state.dtr, vec![true, false]);
+        let commands = state
+            .writes
+            .iter()
+            .map(|bytes| decode_frame(bytes).unwrap().command_type)
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec![CommandType::StopAll]);
+    }
+
+    #[test]
+    fn drop_recovers_from_poisoned_write_mutex_and_finishes_shutdown() {
+        let (client, state, _) = fake_client(&[], 0);
+        let write_mutex = Arc::clone(&client.write_mutex);
+        let heartbeat_stop = Arc::downgrade(&client.heartbeat.as_ref().unwrap().stop);
+
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = write_mutex.lock().unwrap();
+                panic!("poison shared write mutex");
+            })
+            .join()
+            .is_err()
+        );
+
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(client)));
+
+        assert!(dropped.is_ok(), "Drop must not panic on a poisoned mutex");
+        assert!(
+            heartbeat_stop.upgrade().is_none(),
+            "heartbeat must be joined"
+        );
+        let state = state.0.lock().unwrap();
+        assert_eq!(state.dtr, vec![true, false]);
+        let commands = state
+            .writes
+            .iter()
+            .map(|bytes| decode_frame(bytes).unwrap().command_type)
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec![CommandType::StopAll]);
+    }
+
+    #[test]
+    fn drop_recovers_from_poisoned_heartbeat_stop_mutex_and_finishes_shutdown() {
+        let (client, state, _) = fake_client(&[], 0);
+        let stop = Arc::clone(&client.heartbeat.as_ref().unwrap().stop);
+        let heartbeat_stop = Arc::downgrade(&stop);
+
+        assert!(
+            std::thread::spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    let _guard = stop.0.lock().unwrap();
+                    panic!("poison heartbeat stop mutex");
+                }
+            })
+            .join()
+            .is_err()
+        );
+        drop(stop);
+
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(client)));
+
+        assert!(dropped.is_ok(), "Drop must not panic on a poisoned mutex");
+        assert!(
+            heartbeat_stop.upgrade().is_none(),
+            "heartbeat must be joined"
+        );
         let state = state.0.lock().unwrap();
         assert_eq!(state.dtr, vec![true, false]);
         let commands = state
