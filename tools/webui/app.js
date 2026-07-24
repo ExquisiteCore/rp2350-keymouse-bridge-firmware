@@ -44,6 +44,7 @@ export class SerialHidClient {
     responseTimeoutMs = 1200,
     retries = 2,
     heartbeatIntervalMs = 500,
+    cleanupTimeoutMs = 1000,
   } = {}) {
     this.serial = serial;
     this.timers = timers;
@@ -52,6 +53,7 @@ export class SerialHidClient {
     this.responseTimeoutMs = responseTimeoutMs;
     this.retries = retries;
     this.heartbeatIntervalMs = heartbeatIntervalMs;
+    this.cleanupTimeoutMs = cleanupTimeoutMs;
     this.port = null;
     this.reader = null;
     this.readTask = null;
@@ -64,9 +66,16 @@ export class SerialHidClient {
     this.writeQueue = Promise.resolve();
     this.heartbeatTimer = null;
     this.batchDurationMs = null;
+    this.lifecycleQueue = Promise.resolve();
+    this.disconnectTask = null;
+    this.generation = 0;
   }
 
-  async connect() {
+  connect() {
+    return this.queueLifecycle(() => this.connectTransition());
+  }
+
+  async connectTransition() {
     if (!this.serial) {
       throw new Error("当前浏览器不支持 Web Serial");
     }
@@ -86,11 +95,22 @@ export class SerialHidClient {
       dtrAttempted = true;
       await port.setSignals({ dataTerminalReady: true });
 
+      const generation = this.generation + 1;
+      this.generation = generation;
       this.port = port;
       this.writer = writer;
+      this.reader = null;
+      this.readTask = null;
+      this.rxBuffer = new Uint8Array();
+      this.pending = new Map();
+      this.commandQueue = Promise.resolve();
+      this.writeQueue = Promise.resolve();
+      this.heartbeatTimer = null;
+      this.batchDurationMs = null;
       this.connected = true;
-      this.startHeartbeat();
-      this.readTask = this.readLoop();
+      this.startHeartbeat(generation, writer, port);
+      const pending = this.pending;
+      this.readTask = this.readLoop(generation, port, pending);
     } catch (error) {
       if (dtrAttempted) {
         try {
@@ -117,13 +137,24 @@ export class SerialHidClient {
     }
   }
 
-  startHeartbeat() {
+  isSessionActive(generation, writer = this.writer, port = this.port) {
+    return this.connected
+      && this.generation === generation
+      && this.writer === writer
+      && this.port === port;
+  }
+
+  startHeartbeat(generation = this.generation, writer = this.writer, port = this.port) {
     const frame = encodeFrame(0, CommandType.Heartbeat, new Uint8Array(), FLAG_NO_RESPONSE);
     this.heartbeatTimer = this.timers.setInterval(() => {
-      if (!this.connected || !this.writer) {
+      if (!this.isSessionActive(generation, writer, port)) {
         return;
       }
-      this.queueWrite(frame).catch((error) => this.log("error", "HEARTBEAT", error.message));
+      this.queueWrite(frame, generation, writer, port).catch((error) => {
+        if (this.isSessionActive(generation, writer, port)) {
+          this.log("error", "HEARTBEAT", error.message);
+        }
+      });
     }, this.heartbeatIntervalMs);
   }
 
@@ -134,12 +165,12 @@ export class SerialHidClient {
     }
   }
 
-  queueWrite(frame) {
+  queueWrite(frame, generation = this.generation, writer = this.writer, port = this.port) {
+    if (!writer || !this.isSessionActive(generation, writer, port)) {
+      return Promise.reject(new Error("serial is not connected"));
+    }
     const operation = this.writeQueue.catch(() => {}).then(async () => {
-      if (!this.writer) {
-        throw new Error("serial is not connected");
-      }
-      await this.writer.write(frame);
+      await writer.write(frame);
     });
     this.writeQueue = operation.catch(() => {});
     return operation;
@@ -197,61 +228,155 @@ export class SerialHidClient {
     return null;
   }
 
-  async disconnect() {
-    this.connected = false;
-
-    if (this.writer) {
-      const stopFrame = encodeFrame(this.nextSequence(), CommandType.StopAll);
-      await this.queueWrite(stopFrame).catch(() => {});
+  disconnect() {
+    if (this.disconnectTask) {
+      return this.disconnectTask;
     }
-    this.stopHeartbeat();
+
+    const captured = this.detachSession();
+    const transition = this.queueLifecycle(async () => {
+      const session = captured ?? this.detachSession();
+      if (session) {
+        await this.cleanupSession(session);
+      }
+    });
+    const task = transition.finally(() => {
+      if (this.disconnectTask === task) {
+        this.disconnectTask = null;
+      }
+    });
+    this.disconnectTask = task;
+    return task;
+  }
+
+  queueLifecycle(operation) {
+    const transition = this.lifecycleQueue.catch(() => {}).then(operation);
+    this.lifecycleQueue = transition.catch(() => {});
+    return transition;
+  }
+
+  detachSession() {
+    const hasSession = this.connected
+      || this.port !== null
+      || this.reader !== null
+      || this.readTask !== null
+      || this.writer !== null;
+    if (!hasSession) {
+      return null;
+    }
+
+    const port = this.port;
+    const reader = this.reader;
+    const readTask = this.readTask;
+    const writer = this.writer;
+    const writeQueue = this.writeQueue;
+    const heartbeatTimer = this.heartbeatTimer;
+    const pending = this.pending;
+    const generation = this.generation;
+
+    this.connected = false;
+    this.generation += 1;
+    this.port = null;
+    this.reader = null;
+    this.readTask = null;
+    this.writer = null;
+    this.rxBuffer = new Uint8Array();
+    this.pending = new Map();
+    this.commandQueue = Promise.resolve();
+    this.writeQueue = Promise.resolve();
+    this.heartbeatTimer = null;
     this.batchDurationMs = null;
 
-    for (const [sequence, pending] of Array.from(this.pending.entries())) {
-      this.rejectPending(sequence, pending, new Error("serial disconnected"));
+    for (const [sequence, request] of Array.from(pending.entries())) {
+      this.rejectPending(sequence, request, new Error("serial disconnected"), pending);
     }
 
-    if (this.reader) {
-      await this.reader.cancel().catch(() => {});
+    return { generation, port, reader, readTask, writer, writeQueue, heartbeatTimer, pending };
+  }
+
+  async cleanupSession({ port, reader, readTask, writer, writeQueue, heartbeatTimer }) {
+    if (writer) {
+      const stopFrame = encodeFrame(this.nextSequence(), CommandType.StopAll);
+      let allowStop = true;
+      const stopWrite = writeQueue.catch(() => {}).then(() => {
+        if (allowStop) {
+          return writer.write(stopFrame);
+        }
+        return undefined;
+      });
+      await this.awaitCleanup(stopWrite);
+      allowStop = false;
     }
-    if (this.readTask) {
-      await this.readTask.catch(() => {});
-      this.readTask = null;
+    if (heartbeatTimer !== null) {
+      this.timers.clearInterval(heartbeatTimer);
     }
-    if (this.port) {
-      await this.port.setSignals({ dataTerminalReady: false }).catch(() => {});
+
+    if (reader) {
+      try {
+        await reader.cancel();
+      } catch {}
     }
-    if (this.writer) {
-      this.writer.releaseLock();
-      this.writer = null;
+    if (readTask) {
+      await this.awaitCleanup(readTask);
     }
-    if (this.port) {
-      await this.port.close().catch(() => {});
-      this.port = null;
+    if (port) {
+      try {
+        await port.setSignals({ dataTerminalReady: false });
+      } catch {}
+    }
+    if (writer) {
+      try {
+        writer.releaseLock();
+      } catch {}
+    }
+    if (port) {
+      try {
+        await port.close();
+      } catch {}
+    }
+  }
+
+  async awaitCleanup(operation) {
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      timer = this.timers.setTimeout(resolve, this.cleanupTimeoutMs);
+    });
+    try {
+      await Promise.race([Promise.resolve(operation).catch(() => {}), timeout]);
+    } finally {
+      if (timer !== null) {
+        this.timers.clearTimeout(timer);
+      }
     }
   }
 
   send(commandType, payload = new Uint8Array()) {
-    if (!this.writer || !this.connected) {
+    const generation = this.generation;
+    const writer = this.writer;
+    const port = this.port;
+    if (!writer || !this.isSessionActive(generation, writer, port)) {
       return Promise.reject(new Error("serial is not connected"));
     }
 
     const operation = this.commandQueue
       .catch(() => {})
-      .then(() => this.sendOnce(commandType, payload))
+      .then(() => this.sendOnce(commandType, payload, generation, writer, port))
       .then((response) => {
-        this.recordCompletedCommand(commandType, payload);
+        if (this.isSessionActive(generation, writer, port)) {
+          this.recordCompletedCommand(commandType, payload);
+        }
         return response;
       });
     this.commandQueue = operation.catch(() => {});
     return operation;
   }
 
-  async sendOnce(commandType, payload) {
-    if (!this.writer || !this.connected) {
+  async sendOnce(commandType, payload, generation = this.generation, writer = this.writer, port = this.port) {
+    if (!writer || !this.isSessionActive(generation, writer, port)) {
       throw new Error("serial is not connected");
     }
 
+    const pendingMap = this.pending;
     const sequence = this.nextSequence();
     const frame = encodeFrame(sequence, commandType, payload);
     const started = this.now();
@@ -267,21 +392,25 @@ export class SerialHidClient {
         started,
         retriesRemaining: this.retries,
         responseTimeoutMs: this.responseTimeoutFor(commandType, payload),
+        generation,
+        writer,
+        port,
+        pendingMap,
       };
-      this.pending.set(sequence, pending);
+      pendingMap.set(sequence, pending);
       this.writePending(sequence, pending);
     });
   }
 
   writePending(sequence, pending) {
-    this.queueWrite(pending.frame).then(
+    this.queueWrite(pending.frame, pending.generation, pending.writer, pending.port).then(
       () => this.armResponseTimeout(sequence, pending),
-      (error) => this.rejectPending(sequence, pending, error),
+      (error) => this.rejectPending(sequence, pending, error, pending.pendingMap),
     );
   }
 
   armResponseTimeout(sequence, pending) {
-    if (this.pending.get(sequence) !== pending) {
+    if (!this.pendingIsActive(sequence, pending)) {
       return;
     }
     pending.timer = this.timers.setTimeout(() => {
@@ -291,11 +420,11 @@ export class SerialHidClient {
   }
 
   retryPending(sequence, pending, delayMs, terminalError) {
-    if (this.pending.get(sequence) !== pending) {
+    if (!this.pendingIsActive(sequence, pending)) {
       return;
     }
     if (pending.retriesRemaining === 0) {
-      this.rejectPending(sequence, pending, terminalError);
+      this.rejectPending(sequence, pending, terminalError, pending.pendingMap);
       return;
     }
 
@@ -306,21 +435,26 @@ export class SerialHidClient {
     }
     pending.timer = this.timers.setTimeout(() => {
       pending.timer = null;
-      if (this.pending.get(sequence) === pending) {
+      if (this.pendingIsActive(sequence, pending)) {
         this.writePending(sequence, pending);
       }
     }, delayMs);
   }
 
-  rejectPending(sequence, pending, error) {
-    if (this.pending.get(sequence) !== pending) {
+  pendingIsActive(sequence, pending) {
+    return pending.pendingMap.get(sequence) === pending
+      && this.isSessionActive(pending.generation, pending.writer, pending.port);
+  }
+
+  rejectPending(sequence, pending, error, pendingMap = pending.pendingMap ?? this.pending) {
+    if (pendingMap.get(sequence) !== pending) {
       return;
     }
     if (pending.timer !== null) {
       this.timers.clearTimeout(pending.timer);
       pending.timer = null;
     }
-    this.pending.delete(sequence);
+    pendingMap.delete(sequence);
     pending.reject(error);
   }
 
@@ -333,31 +467,49 @@ export class SerialHidClient {
     return sequence;
   }
 
-  async readLoop() {
-    while (this.port?.readable && this.connected) {
-      this.reader = this.port.readable.getReader();
+  async readLoop(generation = this.generation, port = this.port, pendingMap = this.pending) {
+    while (port?.readable && this.isSessionActive(generation, this.writer, port)) {
+      const writer = this.writer;
+      const reader = port.readable.getReader();
+      this.reader = reader;
       try {
-        while (this.connected) {
-          const { value, done } = await this.reader.read();
+        while (this.isSessionActive(generation, writer, port)) {
+          const { value, done } = await reader.read();
+          if (!this.isSessionActive(generation, writer, port)) {
+            break;
+          }
           if (done) {
             break;
           }
           if (value) {
-            this.acceptBytes(value);
+            this.acceptBytes(value, generation, writer, port, pendingMap);
           }
         }
       } catch (error) {
-        if (this.connected) {
+        if (this.isSessionActive(generation, writer, port)) {
           this.log("error", "RX", error.message);
         }
       } finally {
-        this.reader.releaseLock();
-        this.reader = null;
+        try {
+          reader.releaseLock();
+        } catch {}
+        if (this.reader === reader) {
+          this.reader = null;
+        }
       }
     }
   }
 
-  acceptBytes(chunk) {
+  acceptBytes(
+    chunk,
+    generation = this.generation,
+    writer = this.writer,
+    port = this.port,
+    pendingMap = this.pending,
+  ) {
+    if (!this.isSessionActive(generation, writer, port)) {
+      return;
+    }
     const merged = new Uint8Array(this.rxBuffer.length + chunk.length);
     merged.set(this.rxBuffer);
     merged.set(chunk, this.rxBuffer.length);
@@ -366,17 +518,27 @@ export class SerialHidClient {
 
     for (const frameBytes of frames) {
       try {
-        this.acceptFrame(decodeFrame(frameBytes), frameBytes);
+        this.acceptFrame(decodeFrame(frameBytes), frameBytes, generation, writer, port, pendingMap);
       } catch (error) {
         this.log("error", "DECODE", error.message);
       }
     }
   }
 
-  acceptFrame(frame, frameBytes) {
+  acceptFrame(
+    frame,
+    frameBytes,
+    generation = this.generation,
+    writer = this.writer,
+    port = this.port,
+    pendingMap = this.pending,
+  ) {
+    if (!this.isSessionActive(generation, writer, port)) {
+      return;
+    }
     this.log("rx", CommandName[frame.commandType] ?? `0x${frame.commandType.toString(16)}`, bytesToHex(frameBytes));
 
-    const pending = this.pending.get(frame.sequence);
+    const pending = pendingMap.get(frame.sequence);
     if (!pending) {
       this.log("info", "STALE", `seq=${frame.sequence}`);
       return;
@@ -384,7 +546,7 @@ export class SerialHidClient {
 
     if (frame.commandType === CommandType.Nack) {
       const code = frame.payload[0] ?? 0;
-      this.rejectPending(frame.sequence, pending, new Error(`NACK ${code}`));
+      this.rejectPending(frame.sequence, pending, new Error(`NACK ${code}`), pendingMap);
       return;
     }
 
@@ -394,7 +556,7 @@ export class SerialHidClient {
         pending.timer = null;
       }
       if (frame.payload.length !== 3) {
-        this.rejectPending(frame.sequence, pending, new Error(`malformed BUSY payload (${frame.payload.length} bytes)`));
+        this.rejectPending(frame.sequence, pending, new Error(`malformed BUSY payload (${frame.payload.length} bytes)`), pendingMap);
         return;
       }
       const reason = frame.payload[0];
@@ -414,6 +576,7 @@ export class SerialHidClient {
         frame.sequence,
         pending,
         new Error(`unexpected ${CommandName[frame.commandType]}, expected ${CommandName[expected]}`),
+        pendingMap,
       );
       return;
     }
@@ -422,7 +585,7 @@ export class SerialHidClient {
       this.timers.clearTimeout(pending.timer);
       pending.timer = null;
     }
-    this.pending.delete(frame.sequence);
+    pendingMap.delete(frame.sequence);
     frame.elapsedMs = Math.round(this.now() - pending.started);
     pending.resolve(frame);
   }

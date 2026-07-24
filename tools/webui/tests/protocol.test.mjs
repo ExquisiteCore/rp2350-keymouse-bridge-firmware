@@ -60,6 +60,11 @@ function fakeTimers(events = []) {
       assert.ok(timer, `missing interval scheduled for ${delay} ms`);
       timer.callback();
     },
+    intervalCallbackFor(delay) {
+      const timer = Array.from(intervals.values()).find((candidate) => candidate.delay === delay);
+      assert.ok(timer, `missing interval scheduled for ${delay} ms`);
+      return timer.callback;
+    },
   };
 }
 
@@ -218,6 +223,69 @@ function gatedSerial() {
     get maxConcurrentWrites() {
       return maxConcurrentWrites;
     },
+  };
+}
+
+function hungSerial() {
+  const events = [];
+  const writes = [];
+  let markFirstWriteStarted;
+  const firstWriteStarted = new Promise((resolve) => {
+    markFirstWriteStarted = resolve;
+  });
+  let releaseFirstWrite;
+  const firstWriteGate = new Promise((resolve) => {
+    releaseFirstWrite = resolve;
+  });
+  const neverRead = new Promise(() => {});
+  let writeCount = 0;
+  const reader = {
+    read() {
+      events.push("reader:read");
+      return neverRead;
+    },
+    async cancel() {
+      events.push("reader:cancel");
+    },
+    releaseLock() {
+      events.push("reader:release");
+    },
+  };
+  const writer = {
+    async write(frame) {
+      const copy = frame.slice();
+      writes.push(copy);
+      events.push(`write:${decodeFrame(copy).commandType}`);
+      writeCount += 1;
+      if (writeCount === 1) {
+        markFirstWriteStarted();
+        await firstWriteGate;
+      }
+    },
+    releaseLock() {
+      events.push("writer:release");
+    },
+  };
+  const port = {
+    readable: { getReader: () => reader },
+    writable: { getWriter: () => writer },
+    async open() {
+      events.push("open");
+    },
+    async setSignals({ dataTerminalReady }) {
+      events.push(`dtr:${dataTerminalReady}`);
+    },
+    async close() {
+      events.push("close");
+    },
+  };
+  return {
+    serial: { requestPort: async () => port },
+    port,
+    writes,
+    events,
+    firstWriteStarted,
+    releaseFirstWrite,
   };
 }
 
@@ -556,6 +624,135 @@ test("disconnect orders STOP_ALL before heartbeat stop, DTR low, and close", asy
   assert.equal(client.pending.size, 0);
   assert.equal(client.responseTimeoutFor(CommandType.BatchEnd, new Uint8Array()), 1000);
   await assert.rejects(client.send(CommandType.Ping), /serial is not connected/);
+});
+
+test("disconnect immediately invalidates pending work and bounds hung write and read cleanup", async () => {
+  const serialState = hungSerial();
+  const timers = fakeTimers(serialState.events);
+  const client = makeClient(serialState, timers, { cleanupTimeoutMs: 25 });
+  await client.connect();
+
+  const request = client.send(CommandType.Ping);
+  const rejectedRequest = assert.rejects(request, /serial disconnected/);
+  await serialState.firstWriteStarted;
+
+  const disconnect = client.disconnect();
+  assert.equal(client.connected, false);
+  assert.equal(client.pending.size, 0);
+  await rejectedRequest;
+
+  timers.runTimeout(25);
+  await flushMicrotasks();
+  assert.ok(serialState.events.includes("reader:cancel"));
+  timers.runTimeout(25);
+  await disconnect;
+
+  assert.ok(serialState.events.includes("dtr:false"));
+  assert.ok(serialState.events.includes("writer:release"));
+  assert.ok(serialState.events.includes("close"));
+  assert.equal(serialState.events.filter((event) => event === "reader:cancel").length, 1);
+  assert.equal(serialState.events.filter((event) => event === "writer:release").length, 1);
+  assert.equal(serialState.events.filter((event) => event === "close").length, 1);
+});
+
+test("concurrent manual and physical disconnects share one cleanup", async () => {
+  const serialState = hungSerial();
+  const timers = fakeTimers(serialState.events);
+  const client = makeClient(serialState, timers, { cleanupTimeoutMs: 25 });
+  const ui = [];
+  await client.connect();
+
+  const request = client.send(CommandType.Ping);
+  const rejectedRequest = assert.rejects(request, /serial disconnected/);
+  await serialState.firstWriteStarted;
+
+  let firstSettled = false;
+  let secondSettled = false;
+  let physicalSettled = false;
+  const first = client.disconnect().then(() => { firstSettled = true; });
+  const second = client.disconnect().then(() => { secondSettled = true; });
+  const physical = handlePhysicalDisconnect(
+    client,
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  ).then(() => { physicalSettled = true; });
+  await rejectedRequest;
+  await flushMicrotasks();
+
+  assert.equal(firstSettled, false);
+  assert.equal(secondSettled, false);
+  assert.equal(physicalSettled, false);
+
+  timers.runTimeout(25);
+  await flushMicrotasks();
+  timers.runTimeout(25);
+  await Promise.all([first, second, physical]);
+
+  assert.equal(serialState.events.filter((event) => event === "reader:cancel").length, 1);
+  assert.equal(serialState.events.filter((event) => event === "reader:release").length, 0);
+  assert.equal(serialState.events.filter((event) => event === "writer:release").length, 1);
+  assert.equal(serialState.events.filter((event) => event === "close").length, 1);
+  assert.deepEqual(ui.slice(-2), ["connected:false", "info:DETACH:serial device removed"]);
+});
+
+test("reconnect waits for old cleanup and stale callbacks cannot affect the new session", async () => {
+  const first = hungSerial();
+  const second = fakeSerial();
+  const ports = [first.port, second.port];
+  const timers = fakeTimers();
+  const client = makeClient({
+    serial: { requestPort: async () => ports.shift() },
+  }, timers, { cleanupTimeoutMs: 25 });
+  await client.connect();
+
+  const staleHeartbeat = timers.intervalCallbackFor(500);
+  const oldRequest = client.send(CommandType.Ping);
+  const rejectedOldRequest = assert.rejects(oldRequest, /serial disconnected/);
+  await first.firstWriteStarted;
+  const oldPending = client.pending.get(1);
+  client.armResponseTimeout(1, oldPending);
+  const staleTimeout = timers.callbackFor(1000);
+  const busy = responseFrame(1, CommandType.Busy, new Uint8Array([3, 0, 40]));
+  client.acceptFrame(decodeFrame(busy), busy);
+  const staleRetry = timers.callbackFor(40);
+  staleHeartbeat();
+  await flushMicrotasks();
+
+  const disconnect = client.disconnect();
+  client.serial = { requestPort: async () => ports.shift() };
+  const reconnect = client.connect();
+  await rejectedOldRequest;
+  await flushMicrotasks();
+  assert.equal(second.events.length, 0);
+
+  timers.runTimeout(25);
+  await flushMicrotasks();
+  timers.runTimeout(25);
+  await Promise.all([disconnect, reconnect]);
+  assert.equal(client.connected, true);
+  assert.ok(first.events.includes("close"));
+  assert.ok(second.events.includes("dtr:true"));
+
+  first.releaseFirstWrite();
+  staleTimeout();
+  staleRetry();
+  staleHeartbeat();
+  await flushMicrotasks();
+  assert.equal(second.writes.length, 0);
+  assert.equal(second.events.filter((event) => event === "close").length, 0);
+  assert.equal(client.connected, true);
+
+  const newRequest = client.send(CommandType.Ping);
+  await flushMicrotasks();
+  assert.equal(second.writes.length, 1);
+  const newFrame = decodeFrame(second.writes[0]);
+  const ack = responseFrame(newFrame.sequence, CommandType.Ack);
+  client.acceptFrame(decodeFrame(ack), ack);
+  await newRequest;
+
+  await client.disconnect();
+  assert.equal(second.events.filter((event) => event === "writer:release").length, 1);
+  assert.equal(second.events.filter((event) => event === "close").length, 1);
 });
 
 test("physical disconnect fully closes the session and stale timeout cannot retry after reconnect", async () => {
