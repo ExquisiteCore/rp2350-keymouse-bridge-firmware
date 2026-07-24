@@ -95,6 +95,7 @@ fn main() -> Result<()> {
         retries: cli.retries,
         vid: parse_hex_u16(&cli.vid)?,
         pid: parse_hex_u16(&cli.pid)?,
+        heartbeat_interval: Duration::from_millis(500),
     };
     let mut client = HidClient::open(&options)?;
 

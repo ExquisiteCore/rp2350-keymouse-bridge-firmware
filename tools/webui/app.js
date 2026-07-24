@@ -1,6 +1,7 @@
 import {
   CommandName,
   CommandType,
+  FLAG_NO_RESPONSE,
   MAX_FRAME_SIZE,
   asciiPayload,
   bytePayload,
@@ -16,8 +17,8 @@ import {
 import { parseCombo } from "./keys.js";
 import { parseButton, parseScript } from "./script.js";
 
-const $ = (selector) => document.querySelector(selector);
-const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+const $ = (selector) => globalThis.document?.querySelector(selector) ?? null;
+const $$ = (selector) => Array.from(globalThis.document?.querySelectorAll(selector) ?? []);
 
 const statusPill = $("#statusPill");
 const portLabel = $("#portLabel");
@@ -34,42 +35,156 @@ mouse move 10 -5
 wait 100
 stop`;
 
-class SerialHidClient {
-  constructor() {
+export class SerialHidClient {
+  constructor({
+    serial = globalThis.navigator?.serial,
+    timers = globalThis,
+    now = () => globalThis.performance.now(),
+    log = addLog,
+    responseTimeoutMs = 1200,
+    retries = 2,
+    heartbeatIntervalMs = 500,
+  } = {}) {
+    this.serial = serial;
+    this.timers = timers;
+    this.now = now;
+    this.log = log;
+    this.responseTimeoutMs = responseTimeoutMs;
+    this.retries = retries;
+    this.heartbeatIntervalMs = heartbeatIntervalMs;
     this.port = null;
     this.reader = null;
+    this.readTask = null;
     this.writer = null;
     this.rxBuffer = new Uint8Array();
     this.sequence = 1;
     this.pending = new Map();
     this.connected = false;
     this.commandQueue = Promise.resolve();
+    this.writeQueue = Promise.resolve();
+    this.heartbeatTimer = null;
+    this.batchDurationMs = null;
   }
 
   async connect() {
-    if (!("serial" in navigator)) {
+    if (!this.serial) {
       throw new Error("当前浏览器不支持 Web Serial");
     }
 
-    this.port = await navigator.serial.requestPort({
+    this.port = await this.serial.requestPort({
       filters: [{ usbVendorId: 0xcafe, usbProductId: 0x2350 }],
     });
     await this.port.open({ baudRate: 115200, bufferSize: MAX_FRAME_SIZE });
     this.writer = this.port.writable.getWriter();
+    await this.port.setSignals({ dataTerminalReady: true });
     this.connected = true;
-    this.readLoop();
+    this.startHeartbeat();
+    this.readTask = this.readLoop();
+  }
+
+  startHeartbeat() {
+    const frame = encodeFrame(0, CommandType.Heartbeat, new Uint8Array(), FLAG_NO_RESPONSE);
+    this.heartbeatTimer = this.timers.setInterval(() => {
+      if (!this.connected || !this.writer) {
+        return;
+      }
+      this.queueWrite(frame).catch((error) => this.log("error", "HEARTBEAT", error.message));
+    }, this.heartbeatIntervalMs);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatTimer !== null) {
+      this.timers.clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  queueWrite(frame) {
+    const operation = this.writeQueue.catch(() => {}).then(async () => {
+      if (!this.writer) {
+        throw new Error("serial is not connected");
+      }
+      await this.writer.write(frame);
+    });
+    this.writeQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  responseTimeoutFor(commandType, payload) {
+    let requiredMs = 1000;
+    if (commandType === CommandType.BatchEnd) {
+      requiredMs = (this.batchDurationMs ?? 0) + 1000;
+    } else {
+      const durationMs = this.commandDurationMs(commandType, payload);
+      if (durationMs !== null) {
+        requiredMs = durationMs + 500;
+      }
+    }
+    return Math.max(this.responseTimeoutMs, requiredMs);
+  }
+
+  recordCompletedCommand(commandType, payload) {
+    if (commandType === CommandType.BatchBegin) {
+      this.batchDurationMs = 0;
+      return;
+    }
+    if (commandType === CommandType.BatchEnd || commandType === CommandType.StopAll) {
+      this.batchDurationMs = null;
+      return;
+    }
+
+    const durationMs = this.commandDurationMs(commandType, payload);
+    if (this.batchDurationMs !== null && durationMs !== null) {
+      this.batchDurationMs += durationMs;
+    }
+  }
+
+  commandDurationMs(commandType, payload) {
+    if (commandType === CommandType.WaitMs && payload.length === 4) {
+      return (((payload[0] << 24) >>> 0) + (payload[1] << 16) + (payload[2] << 8) + payload[3]) >>> 0;
+    }
+    if (commandType === CommandType.TypeAscii) {
+      return payload.length * 8;
+    }
+    if (commandType === CommandType.MouseMoveRel && payload.length === 4) {
+      const dxRaw = (payload[0] << 8) | payload[1];
+      const dyRaw = (payload[2] << 8) | payload[3];
+      const dx = dxRaw & 0x8000 ? dxRaw - 0x10000 : dxRaw;
+      const dy = dyRaw & 0x8000 ? dyRaw - 0x10000 : dyRaw;
+      return Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 127);
+    }
+    if (commandType === CommandType.KeyTap) {
+      return 8;
+    }
+    if (commandType === CommandType.MouseClick) {
+      return 20;
+    }
+    return null;
   }
 
   async disconnect() {
     this.connected = false;
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("serial disconnected"));
+
+    if (this.writer) {
+      const stopFrame = encodeFrame(this.nextSequence(), CommandType.StopAll);
+      await this.queueWrite(stopFrame).catch(() => {});
     }
-    this.pending.clear();
+    this.stopHeartbeat();
+    this.batchDurationMs = null;
+
+    for (const [sequence, pending] of Array.from(this.pending.entries())) {
+      this.rejectPending(sequence, pending, new Error("serial disconnected"));
+    }
 
     if (this.reader) {
       await this.reader.cancel().catch(() => {});
+    }
+    if (this.readTask) {
+      await this.readTask.catch(() => {});
+      this.readTask = null;
+    }
+    if (this.port) {
+      await this.port.setSignals({ dataTerminalReady: false }).catch(() => {});
     }
     if (this.writer) {
       this.writer.releaseLock();
@@ -82,7 +197,17 @@ class SerialHidClient {
   }
 
   send(commandType, payload = new Uint8Array()) {
-    const operation = this.commandQueue.catch(() => {}).then(() => this.sendOnce(commandType, payload));
+    if (!this.writer || !this.connected) {
+      return Promise.reject(new Error("serial is not connected"));
+    }
+
+    const operation = this.commandQueue
+      .catch(() => {})
+      .then(() => this.sendOnce(commandType, payload))
+      .then((response) => {
+        this.recordCompletedCommand(commandType, payload);
+        return response;
+      });
     this.commandQueue = operation.catch(() => {});
     return operation;
   }
@@ -94,28 +219,74 @@ class SerialHidClient {
 
     const sequence = this.nextSequence();
     const frame = encodeFrame(sequence, commandType, payload);
-    const started = performance.now();
-    addLog("tx", CommandName[commandType] ?? `0x${commandType.toString(16)}`, bytesToHex(frame));
+    const started = this.now();
+    this.log("tx", CommandName[commandType] ?? `0x${commandType.toString(16)}`, bytesToHex(frame));
 
-    const responsePromise = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(sequence);
-        reject(new Error("response timeout"));
-      }, 1200);
-      this.pending.set(sequence, { commandType, resolve, reject, timer, started });
+    return new Promise((resolve, reject) => {
+      const pending = {
+        commandType,
+        frame,
+        resolve,
+        reject,
+        timer: null,
+        started,
+        retriesRemaining: this.retries,
+        responseTimeoutMs: this.responseTimeoutFor(commandType, payload),
+      };
+      this.pending.set(sequence, pending);
+      this.writePending(sequence, pending);
     });
+  }
 
-    try {
-      await this.writer.write(frame);
-    } catch (error) {
-      const pending = this.pending.get(sequence);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pending.delete(sequence);
-      }
-      throw error;
+  writePending(sequence, pending) {
+    this.queueWrite(pending.frame).then(
+      () => this.armResponseTimeout(sequence, pending),
+      (error) => this.rejectPending(sequence, pending, error),
+    );
+  }
+
+  armResponseTimeout(sequence, pending) {
+    if (this.pending.get(sequence) !== pending) {
+      return;
     }
-    return responsePromise;
+    pending.timer = this.timers.setTimeout(() => {
+      pending.timer = null;
+      this.retryPending(sequence, pending, 0, new Error("response timeout"));
+    }, pending.responseTimeoutMs);
+  }
+
+  retryPending(sequence, pending, delayMs, terminalError) {
+    if (this.pending.get(sequence) !== pending) {
+      return;
+    }
+    if (pending.retriesRemaining === 0) {
+      this.rejectPending(sequence, pending, terminalError);
+      return;
+    }
+
+    pending.retriesRemaining -= 1;
+    if (delayMs === 0) {
+      this.writePending(sequence, pending);
+      return;
+    }
+    pending.timer = this.timers.setTimeout(() => {
+      pending.timer = null;
+      if (this.pending.get(sequence) === pending) {
+        this.writePending(sequence, pending);
+      }
+    }, delayMs);
+  }
+
+  rejectPending(sequence, pending, error) {
+    if (this.pending.get(sequence) !== pending) {
+      return;
+    }
+    if (pending.timer !== null) {
+      this.timers.clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    this.pending.delete(sequence);
+    pending.reject(error);
   }
 
   nextSequence() {
@@ -142,7 +313,7 @@ class SerialHidClient {
         }
       } catch (error) {
         if (this.connected) {
-          addLog("error", "RX", error.message);
+          this.log("error", "RX", error.message);
         }
       } finally {
         this.reader.releaseLock();
@@ -162,42 +333,69 @@ class SerialHidClient {
       try {
         this.acceptFrame(decodeFrame(frameBytes), frameBytes);
       } catch (error) {
-        addLog("error", "DECODE", error.message);
+        this.log("error", "DECODE", error.message);
       }
     }
   }
 
   acceptFrame(frame, frameBytes) {
-    addLog("rx", CommandName[frame.commandType] ?? `0x${frame.commandType.toString(16)}`, bytesToHex(frameBytes));
+    this.log("rx", CommandName[frame.commandType] ?? `0x${frame.commandType.toString(16)}`, bytesToHex(frameBytes));
 
     const pending = this.pending.get(frame.sequence);
     if (!pending) {
-      addLog("info", "STALE", `seq=${frame.sequence}`);
+      this.log("info", "STALE", `seq=${frame.sequence}`);
       return;
     }
 
-    this.pending.delete(frame.sequence);
-    clearTimeout(pending.timer);
-
     if (frame.commandType === CommandType.Nack) {
       const code = frame.payload[0] ?? 0;
-      pending.reject(new Error(`NACK ${code}`));
+      this.rejectPending(frame.sequence, pending, new Error(`NACK ${code}`));
+      return;
+    }
+
+    if (frame.commandType === CommandType.Busy) {
+      if (pending.timer !== null) {
+        this.timers.clearTimeout(pending.timer);
+        pending.timer = null;
+      }
+      if (frame.payload.length !== 3) {
+        this.rejectPending(frame.sequence, pending, new Error(`malformed BUSY payload (${frame.payload.length} bytes)`));
+        return;
+      }
+      const reason = frame.payload[0];
+      const delayMs = (frame.payload[1] << 8) | frame.payload[2];
+      this.retryPending(
+        frame.sequence,
+        pending,
+        delayMs,
+        new Error(`device remained BUSY (reason ${reason})`),
+      );
       return;
     }
 
     const expected = expectedResponseType(pending.commandType);
     if (frame.commandType !== expected) {
-      pending.reject(new Error(`unexpected ${CommandName[frame.commandType]}, expected ${CommandName[expected]}`));
+      this.rejectPending(
+        frame.sequence,
+        pending,
+        new Error(`unexpected ${CommandName[frame.commandType]}, expected ${CommandName[expected]}`),
+      );
       return;
     }
 
-    frame.elapsedMs = Math.round(performance.now() - pending.started);
+    if (pending.timer !== null) {
+      this.timers.clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    this.pending.delete(frame.sequence);
+    frame.elapsedMs = Math.round(this.now() - pending.started);
     pending.resolve(frame);
   }
 }
 
 const client = new SerialHidClient();
 
+if (globalThis.document) {
 connectBtn.addEventListener("click", async () => {
   await runUiAction(async () => {
     await client.connect();
@@ -246,6 +444,7 @@ navigator.serial?.addEventListener("disconnect", () => {
 
 setConnected(false);
 updateArmState();
+}
 
 async function handleAction(action) {
   const handlers = {

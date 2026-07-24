@@ -94,11 +94,7 @@ export function parseCombo(input) {
     }
   }
 
-  if (keycode === null) {
-    throw new Error(`combo ${input} has no key`);
-  }
-
-  return { modifier, keycode };
+  return { modifier, keycode: keycode ?? 0 };
 }
 
 function parseKeycode(key) {

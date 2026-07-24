@@ -1,4 +1,5 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
+export const FLAG_NO_RESPONSE = 0x01;
 export const MAGIC = [0xa5, 0x5a];
 export const MAX_PAYLOAD_SIZE = 240;
 export const FRAME_OVERHEAD = 11;
@@ -8,6 +9,7 @@ export const CommandType = Object.freeze({
   Ping: 0x01,
   GetInfo: 0x02,
   GetCaps: 0x03,
+  Heartbeat: 0x04,
   KeyDown: 0x10,
   KeyUp: 0x11,
   KeyTap: 0x12,
@@ -39,7 +41,7 @@ export class DecodeError extends Error {
   }
 }
 
-export function encodeFrame(sequence, commandType, payload = new Uint8Array()) {
+export function encodeFrame(sequence, commandType, payload = new Uint8Array(), flags = 0) {
   const body = toBytes(payload);
   if (body.length > MAX_PAYLOAD_SIZE) {
     throw new RangeError(`payload is ${body.length} bytes, max is ${MAX_PAYLOAD_SIZE}`);
@@ -49,7 +51,7 @@ export function encodeFrame(sequence, commandType, payload = new Uint8Array()) {
   frame[0] = MAGIC[0];
   frame[1] = MAGIC[1];
   frame[2] = PROTOCOL_VERSION;
-  frame[3] = 0;
+  frame[3] = flags;
   writeU16(frame, 4, sequence);
   frame[6] = commandType;
   writeU16(frame, 7, body.length);

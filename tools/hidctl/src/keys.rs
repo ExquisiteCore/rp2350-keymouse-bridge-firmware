@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, bail};
 use hid_protocol::commands::MOD_LEFT_SHIFT;
 
 pub const MOD_LEFT_CTRL: u8 = 0x01;
@@ -33,7 +33,7 @@ pub fn parse_combo(input: &str) -> Result<KeyCombo> {
 
     Ok(KeyCombo {
         modifier,
-        keycode: keycode.ok_or_else(|| anyhow!("combo `{input}` has no key"))?,
+        keycode: keycode.unwrap_or(0),
     })
 }
 
@@ -132,6 +132,24 @@ mod tests {
             KeyCombo {
                 modifier: MOD_LEFT_SHIFT,
                 keycode: 0x15
+            }
+        );
+    }
+
+    #[test]
+    fn parses_modifier_only_combos() {
+        assert_eq!(
+            parse_combo("SHIFT").unwrap(),
+            KeyCombo {
+                modifier: MOD_LEFT_SHIFT,
+                keycode: 0
+            }
+        );
+        assert_eq!(
+            parse_combo("CTRL+SHIFT").unwrap(),
+            KeyCombo {
+                modifier: MOD_LEFT_CTRL | MOD_LEFT_SHIFT,
+                keycode: 0
             }
         );
     }
