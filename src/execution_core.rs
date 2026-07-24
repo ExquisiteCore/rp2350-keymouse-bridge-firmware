@@ -146,7 +146,7 @@ pub(crate) async fn execute_command_once<B: ExecutionBackend>(
     Ok(response)
 }
 
-async fn reset_inputs<B: ExecutionBackend>(
+pub(crate) async fn reset_inputs<B: ExecutionBackend>(
     backend: &mut B,
     state: &mut InputState,
 ) -> Result<(), ErrorCode> {

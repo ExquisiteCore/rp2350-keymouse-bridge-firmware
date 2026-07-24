@@ -13,12 +13,16 @@ pub mod owned_command;
 pub mod protocol;
 pub mod runtime_safety;
 pub mod safety;
+pub mod stop_core;
 pub mod usb_identity;
 
 pub use protocol::{
     FLAG_NO_RESPONSE, LEGACY_PROTOCOL_VERSION, MAX_WAIT_MS, PROTOCOL_VERSION, RequestError,
     RequestKind, encode_frame_with_flags, validate_request,
 };
+
+#[cfg(test)]
+mod stop_runtime_tests;
 
 #[cfg(test)]
 mod usb_identity_tests {
@@ -64,6 +68,69 @@ mod protocol_v2_exports_tests {
         assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(FLAG_NO_RESPONSE, 0x01);
         assert_eq!(MAX_WAIT_MS, 60_000);
+    }
+}
+
+#[cfg(test)]
+mod stop_runtime_glue_tests {
+    use crate::coordinator::{Admission, Coordinator, OwnedRequest};
+    use crate::protocol::{CommandType, Frame};
+    use crate::stop_core::StopCore;
+
+    #[test]
+    fn stop_frame_admission_drives_the_production_cancellation_generation() {
+        let mut coordinator = Coordinator::new();
+        let mut stop_core = StopCore::new();
+        let baseline_generation = stop_core.current_generation();
+        let frame = Frame {
+            version: 2,
+            flags: 0,
+            sequence: 700,
+            command_type: CommandType::StopAll,
+            payload: &[],
+        };
+        let owned = OwnedRequest::from_frame(&frame).unwrap();
+        let Admission::Stop(request) = coordinator.admit_prepared(owned) else {
+            panic!("STOP_ALL must use urgent stop admission");
+        };
+
+        let action = stop_core.handle_stop(request);
+
+        assert_ne!(action.cancel_generation(), baseline_generation);
+        assert!(action.enqueue_emergency());
+        assert!(stop_core.emergency_in_flight());
+        assert_eq!(stop_core.pending_stop_count(), 1);
+    }
+
+    #[test]
+    fn non_stop_safety_emergencies_coalesce_and_session_reset_discards_stop_tokens() {
+        let mut stop_core = StopCore::new();
+        let first = stop_core.schedule_emergency();
+        let second = stop_core.schedule_emergency();
+
+        assert!(first.enqueue_emergency());
+        assert!(!second.enqueue_emergency());
+        assert_ne!(first.cancel_generation(), second.cancel_generation());
+        assert!(stop_core.complete_emergency().is_empty());
+        assert!(!stop_core.emergency_in_flight());
+
+        let mut coordinator = Coordinator::new();
+        let frame = Frame {
+            version: 2,
+            flags: 0,
+            sequence: 701,
+            command_type: CommandType::StopAll,
+            payload: &[],
+        };
+        let Admission::Stop(request) =
+            coordinator.admit_prepared(OwnedRequest::from_frame(&frame).unwrap())
+        else {
+            panic!("STOP_ALL must use urgent stop admission");
+        };
+        let _ = stop_core.handle_stop(request);
+        stop_core.clear_pending_stops();
+
+        assert!(stop_core.complete_emergency().is_empty());
     }
 }
 

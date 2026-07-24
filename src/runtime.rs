@@ -2,12 +2,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use embassy_futures::select::{Either, Either3, select, select3};
-use embassy_time::{Instant, Timer};
-use embassy_usb::class::hid::ReadError;
-use embassy_usb::driver::EndpointError;
-use heapless::Vec;
-
 use crate::batch::{BatchCollector, BatchError};
 use crate::command_executor::{
     CancelWait, DeviceResponse, InputState, execute_frame_in_batch, execute_frame_with_cancel,
@@ -15,7 +9,7 @@ use crate::command_executor::{
 };
 use crate::coordinator::{
     Admission, CachedResponse, CompletionToken, Coordinator, OwnedRequest, OwnedRequestBody,
-    RESPONSE_CACHE_SIZE, SafetyEvent, advance_session_generation,
+    SafetyEvent, advance_session_generation,
 };
 use crate::error::ErrorCode;
 use crate::execution_core::{BatchExecutionBackend, execute_batch};
@@ -35,16 +29,21 @@ use crate::runtime_safety::{
     RuntimeLease, RuntimeSafetyAction, RuntimeSafetyStep, admit_runtime_request,
     latest_lease_refresh, runtime_safety_action,
 };
-use crate::safety::{CONTROL_LEASE_MS, CancellationGeneration, PARTIAL_FRAME_TIMEOUT_MS};
+use crate::safety::{CONTROL_LEASE_MS, PARTIAL_FRAME_TIMEOUT_MS};
 use crate::static_resources::{
     CANCEL, JOBS, LEASE_REFRESH, REQUEST_RESET, REQUESTS, RESPONSE_RESET, RESPONSES, RESULTS,
     SAFETY_EVENTS,
 };
+use crate::stop_core::{EmergencyAction, StopCore};
 use crate::usb_device::{
     CdcControl, CdcReceiver, CdcSender, KeyboardReader, KeyboardWriter, MouseWriter,
     set_caps_lock_enabled,
 };
 use crate::usb_identity::caps_lock_from_led_report;
+use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_time::{Instant, Timer};
+use embassy_usb::class::hid::ReadError;
+use embassy_usb::driver::EndpointError;
 
 const BUSY_RETRY_MS: u16 = 10;
 
@@ -254,9 +253,7 @@ pub async fn dispatcher_task() -> ! {
     let mut coordinator = Coordinator::new();
     let mut batch: Option<BatchCollector> = None;
     let mut input_state = InputState::new();
-    let mut cancellation = CancellationGeneration::new();
-    let mut pending_stops = Vec::<CompletionToken, RESPONSE_CACHE_SIZE>::new();
-    let mut emergency_in_flight = false;
+    let mut stop_core = StopCore::new();
 
     loop {
         match select3(
@@ -277,7 +274,7 @@ pub async fn dispatcher_task() -> ! {
                 let runtime_admission = admit_runtime_request(
                     &mut coordinator,
                     request,
-                    emergency_in_flight,
+                    stop_core.emergency_in_flight(),
                     runtime_session,
                     Instant::now().as_millis(),
                 );
@@ -288,7 +285,7 @@ pub async fn dispatcher_task() -> ! {
 
                 match admission {
                     Admission::Execute(request) => {
-                        let baseline_generation = cancellation.current();
+                        let baseline_generation = stop_core.current_generation();
                         if command_type == CommandType::BatchEnd {
                             let Some(collected) = batch.take() else {
                                 let token = request
@@ -336,7 +333,7 @@ pub async fn dispatcher_task() -> ! {
                         let _ = coordinator.complete(token, response.clone());
                         queue_response(response);
                         if result.is_err() {
-                            schedule_emergency(&mut cancellation, &mut emergency_in_flight).await;
+                            apply_emergency_action(stop_core.schedule_emergency()).await;
                         }
                     }
                     Admission::Bypass(request) => {
@@ -345,12 +342,7 @@ pub async fn dispatcher_task() -> ! {
                     Admission::NoResponse(_) => {}
                     Admission::Stop(request) => {
                         batch = None;
-                        let stop = request
-                            .completion_token()
-                            .expect("STOP_ALL must carry a completion token");
-                        let pushed = pending_stops.push(stop);
-                        debug_assert!(pushed.is_ok());
-                        schedule_emergency(&mut cancellation, &mut emergency_in_flight).await;
+                        apply_emergency_action(stop_core.handle_stop(request)).await;
                     }
                     Admission::Replay(response) => {
                         queue_response(response);
@@ -388,9 +380,7 @@ pub async fn dispatcher_task() -> ! {
                     input_state: next_state,
                 } => {
                     input_state = next_state;
-                    emergency_in_flight = false;
-                    let stops = core::mem::take(&mut pending_stops);
-                    for token in stops {
+                    for token in stop_core.complete_emergency() {
                         let response = token.ack();
                         if coordinator.complete(token, response.clone()).is_ok() {
                             queue_response(response);
@@ -404,13 +394,13 @@ pub async fn dispatcher_task() -> ! {
                 while REQUESTS.try_receive().is_ok() {}
                 while RESPONSES.try_receive().is_ok() {}
                 batch = None;
-                pending_stops.clear();
+                stop_core.clear_pending_stops();
                 coordinator.clear_session();
                 APPLIED_SESSION.store(runtime_session, Ordering::Release);
                 if DTR_ASSERTED.load(Ordering::Acquire) {
                     REQUEST_RESET.signal(runtime_session);
                 }
-                schedule_emergency(&mut cancellation, &mut emergency_in_flight).await;
+                apply_emergency_action(stop_core.schedule_emergency()).await;
             }
         }
 
@@ -681,14 +671,9 @@ fn execution_response(
     }
 }
 
-async fn schedule_emergency(
-    cancellation: &mut CancellationGeneration,
-    emergency_in_flight: &mut bool,
-) {
-    let generation = cancellation.cancel();
-    CANCEL.signal(generation);
-    if !*emergency_in_flight {
-        *emergency_in_flight = true;
+async fn apply_emergency_action(action: EmergencyAction) {
+    CANCEL.signal(action.cancel_generation());
+    if action.enqueue_emergency() {
         JOBS.send(ExecutionJob::Emergency).await;
     }
 }

@@ -32,6 +32,7 @@ mod runtime_safety;
 #[allow(dead_code)]
 mod safety;
 mod static_resources;
+mod stop_core;
 #[allow(dead_code)]
 mod usb_device;
 mod usb_identity;
