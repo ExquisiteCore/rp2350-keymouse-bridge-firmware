@@ -12,8 +12,8 @@ import {
   u32Payload,
 } from "../protocol.js";
 import { parseCombo } from "../keys.js";
-import { parseScript } from "../script.js";
-import { SerialHidClient } from "../app.js";
+import { parseScript, planScriptCommands, runScriptCommands } from "../script.js";
+import { SerialHidClient, handlePhysicalDisconnect } from "../app.js";
 
 function fakeTimers(events = []) {
   let nextId = 1;
@@ -42,6 +42,11 @@ function fakeTimers(events = []) {
     },
     delays() {
       return Array.from(timeouts.values(), ({ delay }) => delay);
+    },
+    callbackFor(delay) {
+      const timer = Array.from(timeouts.values()).find((candidate) => candidate.delay === delay);
+      assert.ok(timer, `missing timeout scheduled for ${delay} ms`);
+      return timer.callback;
     },
     runTimeout(delay) {
       const found = Array.from(timeouts.entries()).find(([, timer]) => timer.delay === delay);
@@ -104,6 +109,67 @@ function fakeSerial({ readable = false } = {}) {
     port,
     writes,
     events,
+  };
+}
+
+function gatedSerial() {
+  const events = [];
+  const writes = [];
+  let releaseFirstWrite;
+  let markFirstWriteStarted;
+  const firstWriteStarted = new Promise((resolve) => {
+    markFirstWriteStarted = resolve;
+  });
+  const firstWriteGate = new Promise((resolve) => {
+    releaseFirstWrite = resolve;
+  });
+  let writeCount = 0;
+  let activeWrites = 0;
+  let maxConcurrentWrites = 0;
+  const writer = {
+    async write(frame) {
+      const index = writeCount;
+      writeCount += 1;
+      activeWrites += 1;
+      maxConcurrentWrites = Math.max(maxConcurrentWrites, activeWrites);
+      try {
+        if (index === 0) {
+          markFirstWriteStarted();
+          await firstWriteGate;
+        }
+        const copy = frame.slice();
+        writes.push(copy);
+        events.push(`write:${decodeFrame(copy).commandType}`);
+      } finally {
+        activeWrites -= 1;
+      }
+    },
+    releaseLock() {
+      events.push("writer:release");
+    },
+  };
+  const port = {
+    readable: null,
+    writable: { getWriter: () => writer },
+    async open() {
+      events.push("open");
+    },
+    async setSignals({ dataTerminalReady }) {
+      events.push(`dtr:${dataTerminalReady}`);
+    },
+    async close() {
+      events.push("close");
+    },
+  };
+  return {
+    serial: { requestPort: async () => port },
+    writes,
+    events,
+    firstWriteStarted,
+    releaseFirstWrite,
+    get maxConcurrentWrites() {
+      return maxConcurrentWrites;
+    },
   };
 }
 
@@ -186,6 +252,88 @@ stop
   assert.equal(commands[2].dy, -5);
   assert.deepEqual(commands[3], { kind: "wait", ms: 100 });
   assert.deepEqual(commands[4], { kind: "stop" });
+});
+
+test("plans STOP as a boundary between non-empty script batches", () => {
+  const plan = planScriptCommands(parseScript(`
+wait 10
+stop
+wait 20
+`));
+
+  assert.deepEqual(
+    plan.map((packet) => packet.commandType),
+    [
+      CommandType.BatchBegin,
+      CommandType.WaitMs,
+      CommandType.BatchEnd,
+      CommandType.StopAll,
+      CommandType.BatchBegin,
+      CommandType.WaitMs,
+      CommandType.BatchEnd,
+    ],
+  );
+  assert.deepEqual(plan[1].payload, u32Payload(10));
+  assert.deepEqual(plan[5].payload, u32Payload(20));
+});
+
+test("script planner does not emit empty batches around STOP", () => {
+  const plan = planScriptCommands(parseScript(`
+stop
+stop
+wait 10
+stop
+`));
+
+  assert.deepEqual(
+    plan.map((packet) => packet.commandType),
+    [
+      CommandType.StopAll,
+      CommandType.StopAll,
+      CommandType.BatchBegin,
+      CommandType.WaitMs,
+      CommandType.BatchEnd,
+      CommandType.StopAll,
+    ],
+  );
+  assert.deepEqual(planScriptCommands([]), []);
+});
+
+test("script runner stops without continuing after command error", async () => {
+  const sent = [];
+  const original = new Error("original command error");
+
+  await assert.rejects(
+    runScriptCommands(parseScript("wait 10\nwait 20"), async (commandType) => {
+      sent.push(commandType);
+      if (sent.length === 2) {
+        throw original;
+      }
+    }),
+    (error) => error === original,
+  );
+  assert.deepEqual(sent, [CommandType.BatchBegin, CommandType.WaitMs, CommandType.StopAll]);
+});
+
+test("script runner stops and preserves BatchEnd error", async () => {
+  const sent = [];
+  const original = new Error("original batch error");
+
+  await assert.rejects(
+    runScriptCommands(parseScript("wait 10"), async (commandType) => {
+      sent.push(commandType);
+      if (commandType === CommandType.BatchEnd) {
+        throw original;
+      }
+    }),
+    (error) => error === original,
+  );
+  assert.deepEqual(sent, [
+    CommandType.BatchBegin,
+    CommandType.WaitMs,
+    CommandType.BatchEnd,
+    CommandType.StopAll,
+  ]);
 });
 
 test("connect asserts DTR and heartbeat writes no-response without pending", async () => {
@@ -318,4 +466,78 @@ test("disconnect orders STOP_ALL before heartbeat stop, DTR low, and close", asy
   assert.equal(client.pending.size, 0);
   assert.equal(client.responseTimeoutFor(CommandType.BatchEnd, new Uint8Array()), 1000);
   await assert.rejects(client.send(CommandType.Ping), /serial is not connected/);
+});
+
+test("physical disconnect fully closes the session and stale timeout cannot retry after reconnect", async () => {
+  const first = fakeSerial({ readable: true });
+  const second = fakeSerial();
+  const timers = fakeTimers(first.events);
+  const client = makeClient(first, timers);
+  const ui = [];
+  await client.connect();
+
+  const request = client.send(CommandType.Ping);
+  await flushMicrotasks();
+  const staleTimeout = timers.callbackFor(1000);
+  const detach = handlePhysicalDisconnect(
+    client,
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  );
+
+  await assert.rejects(request, /serial disconnected/);
+  await detach;
+  assert.ok(first.events.includes("heartbeat:stopped"));
+  assert.ok(first.events.includes("reader:cancel"));
+  assert.ok(first.events.includes("dtr:false"));
+  assert.ok(first.events.includes("writer:release"));
+  assert.ok(first.events.includes("close"));
+  assert.equal(client.pending.size, 0);
+  assert.deepEqual(ui.slice(-2), ["connected:false", "info:DETACH:serial device removed"]);
+
+  client.serial = second.serial;
+  await client.connect();
+  staleTimeout();
+  await flushMicrotasks();
+  assert.equal(second.writes.length, 0);
+  await client.disconnect();
+});
+
+test("physical disconnect still closes the UI when cleanup throws", async () => {
+  const ui = [];
+
+  await handlePhysicalDisconnect(
+    { disconnect: async () => { throw new Error("cleanup failed"); } },
+    (connected) => ui.push(`connected:${connected}`),
+    (level, label, message) => ui.push(`${level}:${label}:${message}`),
+  );
+
+  assert.deepEqual(ui, [
+    "error:DETACH:cleanup failed",
+    "connected:false",
+    "info:DETACH:serial device removed",
+  ]);
+});
+
+test("command heartbeat and STOP writes share one serialized writer queue", async () => {
+  const serialState = gatedSerial();
+  const timers = fakeTimers(serialState.events);
+  const client = makeClient(serialState, timers);
+  await client.connect();
+
+  const request = client.send(CommandType.Ping);
+  const rejectedRequest = assert.rejects(request, /serial disconnected/);
+  await serialState.firstWriteStarted;
+  timers.runInterval(500);
+  const disconnect = client.disconnect();
+  await flushMicrotasks();
+  serialState.releaseFirstWrite();
+
+  await rejectedRequest;
+  await disconnect;
+  assert.deepEqual(
+    serialState.writes.map((frame) => decodeFrame(frame).commandType),
+    [CommandType.Ping, CommandType.Heartbeat, CommandType.StopAll],
+  );
+  assert.equal(serialState.maxConcurrentWrites, 1);
 });

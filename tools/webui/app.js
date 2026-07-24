@@ -15,7 +15,7 @@ import {
   u32Payload,
 } from "./protocol.js";
 import { parseCombo } from "./keys.js";
-import { parseButton, parseScript } from "./script.js";
+import { parseButton, parseScript, runScriptCommands } from "./script.js";
 
 const $ = (selector) => globalThis.document?.querySelector(selector) ?? null;
 const $$ = (selector) => Array.from(globalThis.document?.querySelectorAll(selector) ?? []);
@@ -393,6 +393,17 @@ export class SerialHidClient {
   }
 }
 
+export async function handlePhysicalDisconnect(client, setConnectedCallback, log) {
+  try {
+    await client.disconnect();
+  } catch (error) {
+    log("error", "DETACH", error.message);
+  } finally {
+    setConnectedCallback(false);
+    log("info", "DETACH", "serial device removed");
+  }
+}
+
 const client = new SerialHidClient();
 
 if (globalThis.document) {
@@ -438,8 +449,7 @@ $$("[data-click]").forEach((button) => {
 });
 
 navigator.serial?.addEventListener("disconnect", () => {
-  setConnected(false);
-  addLog("info", "DETACH", "serial device removed");
+  void handlePhysicalDisconnect(client, setConnected, addLog);
 });
 
 setConnected(false);
@@ -537,55 +547,8 @@ function parseScriptFromEditor() {
 async function runScriptFromEditor() {
   requireArmed();
   const commands = parseScriptFromEditor();
-  await client.send(CommandType.BatchBegin);
-  try {
-    for (const command of commands) {
-      await executeScriptCommand(command);
-    }
-    await client.send(CommandType.BatchEnd);
-    scriptSummary.textContent = `OK ${commands.length} commands`;
-  } catch (error) {
-    await client.send(CommandType.StopAll).catch(() => {});
-    throw error;
-  }
-}
-
-function executeScriptCommand(command) {
-  if (command.kind === "type") {
-    return client.send(CommandType.TypeAscii, asciiPayload(command.text));
-  }
-  if (command.kind === "key") {
-    const commandType = {
-      tap: CommandType.KeyTap,
-      down: CommandType.KeyDown,
-      up: CommandType.KeyUp,
-    }[command.action];
-    return client.send(commandType, keyPayload(command.combo));
-  }
-  if (command.kind === "mouse") {
-    if (command.action === "move") {
-      return client.send(CommandType.MouseMoveRel, i16PairPayload(command.dx, command.dy));
-    }
-    if (command.action === "click") {
-      return client.send(CommandType.MouseClick, bytePayload(command.button.mask));
-    }
-    if (command.action === "down") {
-      return client.send(CommandType.MouseButtonDown, bytePayload(command.button.mask));
-    }
-    if (command.action === "up") {
-      return client.send(CommandType.MouseButtonUp, bytePayload(command.button.mask));
-    }
-    if (command.action === "wheel") {
-      return client.send(CommandType.MouseWheel, bytePayload(command.delta));
-    }
-  }
-  if (command.kind === "wait") {
-    return client.send(CommandType.WaitMs, u32Payload(command.ms));
-  }
-  if (command.kind === "stop") {
-    return client.send(CommandType.StopAll);
-  }
-  throw new Error(`unknown script command ${command.kind}`);
+  await runScriptCommands(commands, (commandType, payload) => client.send(commandType, payload));
+  scriptSummary.textContent = `OK ${commands.length} commands`;
 }
 
 async function runUiAction(action) {

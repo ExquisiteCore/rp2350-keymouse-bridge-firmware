@@ -6,13 +6,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hid_protocol::protocol::CommandType;
 
-use client::{list_ports, ClientOptions, HidClient};
+use client::{ClientOptions, HidClient, list_ports};
 use keys::parse_combo;
-use script::{parse_script, MouseButtonName, ScriptCommand};
+use script::{MouseButtonName, ScriptCommand, parse_script, run_script_commands};
 
 #[derive(Parser)]
 #[command(author, version, about = "RP2350 USB HID bridge control tool")]
@@ -39,15 +39,21 @@ enum TopCommand {
     Ping,
     Info,
     Caps,
-    Type { text: String },
+    Type {
+        text: String,
+    },
     Key(KeyArgs),
     Mouse {
         #[command(subcommand)]
         command: MouseCommand,
     },
-    Wait { ms: u32 },
+    Wait {
+        ms: u32,
+    },
     Stop,
-    Run { script: PathBuf },
+    Run {
+        script: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -72,9 +78,15 @@ enum MouseCommand {
         #[arg(allow_hyphen_values = true)]
         dy: i16,
     },
-    Click { button: String },
-    Down { button: String },
-    Up { button: String },
+    Click {
+        button: String,
+    },
+    Down {
+        button: String,
+    },
+    Up {
+        button: String,
+    },
     Wheel {
         #[arg(allow_hyphen_values = true)]
         delta: i8,
@@ -157,13 +169,22 @@ fn execute_mouse_command(client: &mut HidClient, command: MouseCommand) -> Resul
             client.send_command(CommandType::MouseMoveRel, &mouse_move_payload(dx, dy))?;
         }
         MouseCommand::Click { button } => {
-            client.send_command(CommandType::MouseClick, &[parse_button_arg(&button)?.mask()])?;
+            client.send_command(
+                CommandType::MouseClick,
+                &[parse_button_arg(&button)?.mask()],
+            )?;
         }
         MouseCommand::Down { button } => {
-            client.send_command(CommandType::MouseButtonDown, &[parse_button_arg(&button)?.mask()])?;
+            client.send_command(
+                CommandType::MouseButtonDown,
+                &[parse_button_arg(&button)?.mask()],
+            )?;
         }
         MouseCommand::Up { button } => {
-            client.send_command(CommandType::MouseButtonUp, &[parse_button_arg(&button)?.mask()])?;
+            client.send_command(
+                CommandType::MouseButtonUp,
+                &[parse_button_arg(&button)?.mask()],
+            )?;
         }
         MouseCommand::Wheel { delta } => {
             client.send_command(CommandType::MouseWheel, &[delta as u8])?;
@@ -173,60 +194,9 @@ fn execute_mouse_command(client: &mut HidClient, command: MouseCommand) -> Resul
 }
 
 fn run_script(client: &mut HidClient, commands: &[ScriptCommand]) -> Result<()> {
-    client.send_command(CommandType::BatchBegin, &[])?;
-    let result = (|| {
-        for command in commands {
-            execute_script_command(client, command)?;
-        }
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let _ = client.send_command(CommandType::StopAll, &[]);
-        return Err(err);
-    }
-
-    client.send_command(CommandType::BatchEnd, &[])?;
-    Ok(())
-}
-
-fn execute_script_command(client: &mut HidClient, command: &ScriptCommand) -> Result<()> {
-    match command {
-        ScriptCommand::TypeAscii(text) => {
-            client.send_command(CommandType::TypeAscii, text.as_bytes())?;
-        }
-        ScriptCommand::KeyTap(combo) => {
-            client.send_command(CommandType::KeyTap, &[combo.modifier, combo.keycode])?;
-        }
-        ScriptCommand::KeyDown(combo) => {
-            client.send_command(CommandType::KeyDown, &[combo.modifier, combo.keycode])?;
-        }
-        ScriptCommand::KeyUp(combo) => {
-            client.send_command(CommandType::KeyUp, &[combo.modifier, combo.keycode])?;
-        }
-        ScriptCommand::MouseMove { dx, dy } => {
-            client.send_command(CommandType::MouseMoveRel, &mouse_move_payload(*dx, *dy))?;
-        }
-        ScriptCommand::MouseClick(button) => {
-            client.send_command(CommandType::MouseClick, &[button.mask()])?;
-        }
-        ScriptCommand::MouseDown(button) => {
-            client.send_command(CommandType::MouseButtonDown, &[button.mask()])?;
-        }
-        ScriptCommand::MouseUp(button) => {
-            client.send_command(CommandType::MouseButtonUp, &[button.mask()])?;
-        }
-        ScriptCommand::MouseWheel(delta) => {
-            client.send_command(CommandType::MouseWheel, &[*delta as u8])?;
-        }
-        ScriptCommand::WaitMs(ms) => {
-            client.send_command(CommandType::WaitMs, &ms.to_be_bytes())?;
-        }
-        ScriptCommand::StopAll => {
-            client.send_command(CommandType::StopAll, &[])?;
-        }
-    }
-    Ok(())
+    run_script_commands(commands, |command_type, payload| {
+        client.send_command(command_type, payload).map(|_| ())
+    })
 }
 
 fn mouse_move_payload(dx: i16, dy: i16) -> [u8; 4] {
@@ -252,8 +222,14 @@ fn parse_hex_u16(input: &str) -> Result<u16> {
 
 fn print_ports() -> Result<()> {
     for port in list_ports()? {
-        let vid = port.vid.map(|v| format!("{v:04X}")).unwrap_or_else(|| "----".into());
-        let pid = port.pid.map(|p| format!("{p:04X}")).unwrap_or_else(|| "----".into());
+        let vid = port
+            .vid
+            .map(|v| format!("{v:04X}"))
+            .unwrap_or_else(|| "----".into());
+        let pid = port
+            .pid
+            .map(|p| format!("{p:04X}"))
+            .unwrap_or_else(|| "----".into());
         let product = port.product.unwrap_or_default();
         let serial = port.serial_number.unwrap_or_default();
         println!("{}\t{}:{}\t{}\t{}", port.name, vid, pid, product, serial);
@@ -262,7 +238,11 @@ fn print_ports() -> Result<()> {
 }
 
 fn format_payload(label: &str, payload: &[u8]) -> String {
-    let hex = payload.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(" ");
+    let hex = payload
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!("{label} {hex}")
 }
 

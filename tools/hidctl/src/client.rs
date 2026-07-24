@@ -104,12 +104,13 @@ struct HeartbeatWorker {
 }
 
 impl HeartbeatWorker {
-    fn stop(self) {
-        {
-            let mut stopped = self.stop.0.lock().unwrap();
-            *stopped = true;
-            self.stop.1.notify_all();
-        }
+    fn request_stop(&self) {
+        let mut stopped = self.stop.0.lock().unwrap();
+        *stopped = true;
+        self.stop.1.notify_all();
+    }
+
+    fn join(self) {
         let _ = self.handle.join();
     }
 }
@@ -350,6 +351,11 @@ impl HidClient {
 
 impl Drop for HidClient {
     fn drop(&mut self) {
+        let heartbeat = self.heartbeat.take();
+        if let Some(worker) = heartbeat.as_ref() {
+            worker.request_stop();
+        }
+
         let sequence = self.next_sequence();
         let mut frame = [0u8; MAX_FRAME_SIZE];
         if let Ok(frame_len) = encode_frame(
@@ -361,8 +367,8 @@ impl Drop for HidClient {
         ) {
             let _ = self.write_frame(&frame[..frame_len]);
         }
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.stop();
+        if let Some(worker) = heartbeat {
+            worker.join();
         }
         let _ = self.port.set_dtr(false);
     }
@@ -390,12 +396,27 @@ fn start_heartbeat(
         .name("hidctl-heartbeat".into())
         .spawn(move || {
             while wait_for_heartbeat_tick(&thread_stop, interval) {
-                let _guard = write_mutex.lock().unwrap();
-                let _ = port.write_all(&frame);
-                let _ = port.flush();
+                if !write_heartbeat_if_running(&thread_stop, &write_mutex, &mut *port, &frame) {
+                    break;
+                }
             }
         })?;
     Ok(HeartbeatWorker { stop, handle })
+}
+
+fn write_heartbeat_if_running(
+    stop: &(Mutex<bool>, Condvar),
+    write_mutex: &Mutex<()>,
+    port: &mut dyn ClientPort,
+    frame: &[u8],
+) -> bool {
+    let _guard = write_mutex.lock().unwrap();
+    if *stop.0.lock().unwrap() {
+        return false;
+    }
+    let _ = port.write_all(frame);
+    let _ = port.flush();
+    true
 }
 
 fn wait_for_heartbeat_tick(stop: &(Mutex<bool>, Condvar), interval: Duration) -> bool {
@@ -534,6 +555,8 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Condvar, Mutex};
 
     #[derive(Default)]
@@ -542,11 +565,17 @@ mod tests {
         writes: Vec<Vec<u8>>,
         timeouts: Vec<Duration>,
         dtr: Vec<bool>,
+        max_concurrent_writes: usize,
+        gate_first_write: bool,
+        first_write_entered: bool,
+        release_first_write: bool,
+        write_entries: usize,
     }
 
     #[derive(Clone)]
     struct FakePort {
         state: Arc<(Mutex<FakeState>, Condvar)>,
+        active_writes: Arc<AtomicUsize>,
     }
 
     impl FakePort {
@@ -559,9 +588,16 @@ mod tests {
             (
                 Self {
                     state: Arc::clone(&state),
+                    active_writes: Arc::new(AtomicUsize::new(0)),
                 },
                 state,
             )
+        }
+
+        fn new_gated(responses: &[Vec<u8>]) -> (Self, Arc<(Mutex<FakeState>, Condvar)>) {
+            let (port, state) = Self::new(responses);
+            state.0.lock().unwrap().gate_first_write = true;
+            (port, state)
         }
     }
 
@@ -581,9 +617,21 @@ mod tests {
 
     impl Write for FakePort {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let concurrent = self.active_writes.fetch_add(1, Ordering::SeqCst) + 1;
             let mut state = self.state.0.lock().unwrap();
+            state.max_concurrent_writes = state.max_concurrent_writes.max(concurrent);
+            state.write_entries += 1;
+            self.state.1.notify_all();
+            if state.gate_first_write && !state.first_write_entered {
+                state.first_write_entered = true;
+                self.state.1.notify_all();
+                while !state.release_first_write {
+                    state = self.state.1.wait(state).unwrap();
+                }
+            }
             state.writes.push(buf.to_vec());
             self.state.1.notify_all();
+            self.active_writes.fetch_sub(1, Ordering::SeqCst);
             Ok(buf.len())
         }
 
@@ -787,6 +835,173 @@ mod tests {
             .map(|bytes| decode_frame(bytes).unwrap().command_type)
             .collect::<Vec<_>>();
         assert_eq!(commands, vec![CommandType::StopAll]);
+    }
+
+    #[test]
+    fn drop_stops_heartbeat_waiting_on_write_lock_before_stop_all() {
+        let (port, state) = FakePort::new(&[]);
+        let mut heartbeat_port = port.clone();
+        let write_mutex = Arc::new(Mutex::new(()));
+        let write_guard = write_mutex.lock().unwrap();
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let mut frame = [0u8; MAX_FRAME_SIZE];
+        let frame_len = encode_frame_with_flags(
+            PROTOCOL_VERSION,
+            FLAG_NO_RESPONSE,
+            0,
+            CommandType::Heartbeat,
+            &[],
+            &mut frame,
+        )
+        .unwrap();
+        let heartbeat_frame = frame[..frame_len].to_vec();
+        let thread_stop = Arc::clone(&stop);
+        let thread_write_mutex = Arc::clone(&write_mutex);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let wrote = write_heartbeat_if_running(
+                &thread_stop,
+                &thread_write_mutex,
+                &mut heartbeat_port,
+                &heartbeat_frame,
+            );
+            result_tx.send(wrote).unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        let client = HidClient {
+            port: Box::new(port),
+            sequence: 1,
+            timeout: Duration::from_millis(100),
+            retries: 0,
+            receive_buffer: Vec::new(),
+            batch_duration_ms: None,
+            write_mutex: Arc::clone(&write_mutex),
+            heartbeat: Some(HeartbeatWorker {
+                stop: Arc::clone(&stop),
+                handle,
+            }),
+            retry_sleep: Arc::new(|_| {}),
+        };
+        let drop_handle = std::thread::spawn(move || drop(client));
+
+        let stopped = stop.0.lock().unwrap();
+        let (stopped, _) = stop
+            .1
+            .wait_timeout_while(stopped, Duration::from_secs(1), |stopped| !*stopped)
+            .unwrap();
+        assert!(
+            *stopped,
+            "Drop must request heartbeat stop before waiting for the write lock"
+        );
+        drop(stopped);
+        drop(write_guard);
+
+        drop_handle.join().unwrap();
+        assert!(!result_rx.recv().unwrap());
+        let state = state.0.lock().unwrap();
+        let commands = state
+            .writes
+            .iter()
+            .map(|bytes| decode_frame(bytes).unwrap().command_type)
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec![CommandType::StopAll]);
+        assert_eq!(state.dtr, vec![false]);
+        assert_eq!(state.max_concurrent_writes, 1);
+    }
+
+    #[test]
+    fn command_and_heartbeat_writes_are_serialized() {
+        let (port, state) = FakePort::new_gated(&[response(1, CommandType::Ack, &[])]);
+        let mut heartbeat_port = port.clone();
+        let write_mutex = Arc::new(Mutex::new(()));
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut frame = [0u8; MAX_FRAME_SIZE];
+        let frame_len = encode_frame_with_flags(
+            PROTOCOL_VERSION,
+            FLAG_NO_RESPONSE,
+            0,
+            CommandType::Heartbeat,
+            &[],
+            &mut frame,
+        )
+        .unwrap();
+        let heartbeat_frame = frame[..frame_len].to_vec();
+        let thread_stop = Arc::clone(&stop);
+        let thread_write_mutex = Arc::clone(&write_mutex);
+        let (trigger_tx, trigger_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            trigger_rx.recv().unwrap();
+            ready_tx.send(()).unwrap();
+            let wrote = write_heartbeat_if_running(
+                &thread_stop,
+                &thread_write_mutex,
+                &mut heartbeat_port,
+                &heartbeat_frame,
+            );
+            result_tx.send(wrote).unwrap();
+        });
+        let heartbeat = HeartbeatWorker {
+            stop: Arc::clone(&stop),
+            handle,
+        };
+        let mut client = HidClient {
+            port: Box::new(port),
+            sequence: 1,
+            timeout: Duration::from_millis(100),
+            retries: 0,
+            receive_buffer: Vec::new(),
+            batch_duration_ms: None,
+            write_mutex,
+            heartbeat: Some(heartbeat),
+            retry_sleep: Arc::new(|_| {}),
+        };
+        let command_handle = std::thread::spawn(move || {
+            client
+                .send_command_with_timeout(CommandType::Ping, &[], Duration::from_secs(1))
+                .unwrap();
+            client
+        });
+
+        let state_lock = state.0.lock().unwrap();
+        let (state_lock, _) = state
+            .1
+            .wait_timeout_while(state_lock, Duration::from_secs(1), |state| {
+                !state.first_write_entered
+            })
+            .unwrap();
+        assert!(state_lock.first_write_entered);
+        trigger_tx.send(()).unwrap();
+        ready_rx.recv().unwrap();
+        let (mut state_lock, _) = state
+            .1
+            .wait_timeout_while(state_lock, Duration::from_millis(200), |state| {
+                state.write_entries < 2
+            })
+            .unwrap();
+        assert_eq!(state_lock.write_entries, 1);
+        state_lock.release_first_write = true;
+        state.1.notify_all();
+        drop(state_lock);
+
+        let client = command_handle.join().unwrap();
+        assert!(result_rx.recv().unwrap());
+        {
+            let state = state.0.lock().unwrap();
+            let commands = state
+                .writes
+                .iter()
+                .map(|bytes| decode_frame(bytes).unwrap().command_type)
+                .collect::<Vec<_>>();
+            assert_eq!(commands, vec![CommandType::Ping, CommandType::Heartbeat]);
+            assert_eq!(state.max_concurrent_writes, 1);
+        }
+        drop(client);
     }
 
     #[test]

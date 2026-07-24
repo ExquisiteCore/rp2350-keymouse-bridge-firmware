@@ -1,5 +1,6 @@
-use anyhow::{anyhow, bail, Result};
-use crate::keys::{parse_combo, KeyCombo};
+use crate::keys::{KeyCombo, parse_combo};
+use anyhow::{Result, anyhow, bail};
+use hid_protocol::protocol::CommandType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptCommand {
@@ -23,6 +24,12 @@ pub enum MouseButtonName {
     Middle,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptPacket {
+    pub command_type: CommandType,
+    pub payload: Vec<u8>,
+}
+
 impl MouseButtonName {
     pub fn mask(self) -> u8 {
         match self {
@@ -33,10 +40,90 @@ impl MouseButtonName {
     }
 }
 
+pub fn plan_script_commands(commands: &[ScriptCommand]) -> Vec<ScriptPacket> {
+    let mut plan = Vec::new();
+    let mut segment = Vec::new();
+
+    for command in commands {
+        if matches!(command, ScriptCommand::StopAll) {
+            append_script_segment(&mut plan, &segment);
+            segment.clear();
+            plan.push(ScriptPacket {
+                command_type: CommandType::StopAll,
+                payload: Vec::new(),
+            });
+        } else {
+            segment.push(command);
+        }
+    }
+    append_script_segment(&mut plan, &segment);
+    plan
+}
+
+pub fn run_script_commands<F>(commands: &[ScriptCommand], mut send: F) -> Result<()>
+where
+    F: FnMut(CommandType, &[u8]) -> Result<()>,
+{
+    for packet in plan_script_commands(commands) {
+        if let Err(error) = send(packet.command_type, &packet.payload) {
+            let _ = send(CommandType::StopAll, &[]);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn append_script_segment(plan: &mut Vec<ScriptPacket>, segment: &[&ScriptCommand]) {
+    if segment.is_empty() {
+        return;
+    }
+
+    plan.push(ScriptPacket {
+        command_type: CommandType::BatchBegin,
+        payload: Vec::new(),
+    });
+    plan.extend(segment.iter().map(|command| script_command_packet(command)));
+    plan.push(ScriptPacket {
+        command_type: CommandType::BatchEnd,
+        payload: Vec::new(),
+    });
+}
+
+fn script_command_packet(command: &ScriptCommand) -> ScriptPacket {
+    let (command_type, payload) = match command {
+        ScriptCommand::TypeAscii(text) => (CommandType::TypeAscii, text.as_bytes().to_vec()),
+        ScriptCommand::KeyTap(combo) => (CommandType::KeyTap, vec![combo.modifier, combo.keycode]),
+        ScriptCommand::KeyDown(combo) => {
+            (CommandType::KeyDown, vec![combo.modifier, combo.keycode])
+        }
+        ScriptCommand::KeyUp(combo) => (CommandType::KeyUp, vec![combo.modifier, combo.keycode]),
+        ScriptCommand::MouseMove { dx, dy } => {
+            let mut payload = Vec::with_capacity(4);
+            payload.extend_from_slice(&dx.to_be_bytes());
+            payload.extend_from_slice(&dy.to_be_bytes());
+            (CommandType::MouseMoveRel, payload)
+        }
+        ScriptCommand::MouseClick(button) => (CommandType::MouseClick, vec![button.mask()]),
+        ScriptCommand::MouseDown(button) => (CommandType::MouseButtonDown, vec![button.mask()]),
+        ScriptCommand::MouseUp(button) => (CommandType::MouseButtonUp, vec![button.mask()]),
+        ScriptCommand::MouseWheel(delta) => (CommandType::MouseWheel, vec![*delta as u8]),
+        ScriptCommand::WaitMs(milliseconds) => {
+            (CommandType::WaitMs, milliseconds.to_be_bytes().to_vec())
+        }
+        ScriptCommand::StopAll => (CommandType::StopAll, Vec::new()),
+    };
+    ScriptPacket {
+        command_type,
+        payload,
+    }
+}
+
 pub fn parse_script(input: &str) -> Result<Vec<ScriptCommand>> {
     let mut commands = Vec::new();
     for (index, line) in input.lines().enumerate() {
-        if let Some(command) = parse_line(line).map_err(|err| anyhow!("line {}: {err}", index + 1))? {
+        if let Some(command) =
+            parse_line(line).map_err(|err| anyhow!("line {}: {err}", index + 1))?
+        {
             commands.push(command);
         }
     }
@@ -207,6 +294,7 @@ fn split_words(line: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hid_protocol::protocol::CommandType;
 
     #[test]
     fn parses_script_lines() {
@@ -222,7 +310,10 @@ mod tests {
             parse_line("mouse move 10 -5").unwrap(),
             Some(ScriptCommand::MouseMove { dx: 10, dy: -5 })
         );
-        assert_eq!(parse_line("wait 100").unwrap(), Some(ScriptCommand::WaitMs(100)));
+        assert_eq!(
+            parse_line("wait 100").unwrap(),
+            Some(ScriptCommand::WaitMs(100))
+        );
         assert_eq!(parse_line("stop").unwrap(), Some(ScriptCommand::StopAll));
     }
 
@@ -230,5 +321,107 @@ mod tests {
     fn ignores_blank_and_comment_lines() {
         assert_eq!(parse_line("").unwrap(), None);
         assert_eq!(parse_line("  # comment").unwrap(), None);
+    }
+
+    #[test]
+    fn plans_stop_as_a_boundary_between_non_empty_batches() {
+        let plan = plan_script_commands(&[
+            ScriptCommand::WaitMs(10),
+            ScriptCommand::StopAll,
+            ScriptCommand::WaitMs(20),
+        ]);
+
+        assert_eq!(
+            plan.iter()
+                .map(|packet| packet.command_type)
+                .collect::<Vec<_>>(),
+            vec![
+                CommandType::BatchBegin,
+                CommandType::WaitMs,
+                CommandType::BatchEnd,
+                CommandType::StopAll,
+                CommandType::BatchBegin,
+                CommandType::WaitMs,
+                CommandType::BatchEnd,
+            ]
+        );
+        assert_eq!(plan[1].payload, 10u32.to_be_bytes());
+        assert_eq!(plan[5].payload, 20u32.to_be_bytes());
+    }
+
+    #[test]
+    fn planner_does_not_emit_empty_batches_around_stops() {
+        let plan = plan_script_commands(&[
+            ScriptCommand::StopAll,
+            ScriptCommand::StopAll,
+            ScriptCommand::WaitMs(10),
+            ScriptCommand::StopAll,
+        ]);
+
+        assert_eq!(
+            plan.iter()
+                .map(|packet| packet.command_type)
+                .collect::<Vec<_>>(),
+            vec![
+                CommandType::StopAll,
+                CommandType::StopAll,
+                CommandType::BatchBegin,
+                CommandType::WaitMs,
+                CommandType::BatchEnd,
+                CommandType::StopAll,
+            ]
+        );
+        assert!(plan_script_commands(&[]).is_empty());
+    }
+
+    #[test]
+    fn runner_stops_without_continuing_after_command_error() {
+        let commands = [ScriptCommand::WaitMs(10), ScriptCommand::WaitMs(20)];
+        let mut sent = Vec::new();
+
+        let error = run_script_commands(&commands, |command_type, _| {
+            sent.push(command_type);
+            if sent.len() == 2 {
+                bail!("original command error");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "original command error");
+        assert_eq!(
+            sent,
+            vec![
+                CommandType::BatchBegin,
+                CommandType::WaitMs,
+                CommandType::StopAll,
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_stops_and_preserves_batch_end_error() {
+        let commands = [ScriptCommand::WaitMs(10)];
+        let mut sent = Vec::new();
+
+        let error = run_script_commands(&commands, |command_type, _| {
+            sent.push(command_type);
+            if command_type == CommandType::BatchEnd {
+                bail!("original batch error");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "original batch error");
+        assert_eq!(
+            sent,
+            vec![
+                CommandType::BatchBegin,
+                CommandType::WaitMs,
+                CommandType::BatchEnd,
+                CommandType::StopAll,
+            ]
+        );
     }
 }

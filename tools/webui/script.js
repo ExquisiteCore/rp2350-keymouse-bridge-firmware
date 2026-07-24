@@ -1,4 +1,12 @@
 import { parseCombo } from "./keys.js";
+import {
+  CommandType,
+  asciiPayload,
+  bytePayload,
+  i16PairPayload,
+  keyPayload,
+  u32Payload,
+} from "./protocol.js";
 
 export function parseScript(input) {
   const commands = [];
@@ -10,6 +18,81 @@ export function parseScript(input) {
     }
   }
   return commands;
+}
+
+export function planScriptCommands(commands) {
+  const plan = [];
+  let segment = [];
+
+  const appendSegment = () => {
+    if (segment.length === 0) {
+      return;
+    }
+    plan.push({ commandType: CommandType.BatchBegin, payload: new Uint8Array() });
+    plan.push(...segment.map(scriptCommandPacket));
+    plan.push({ commandType: CommandType.BatchEnd, payload: new Uint8Array() });
+    segment = [];
+  };
+
+  for (const command of commands) {
+    if (command.kind === "stop") {
+      appendSegment();
+      plan.push({ commandType: CommandType.StopAll, payload: new Uint8Array() });
+    } else {
+      segment.push(command);
+    }
+  }
+  appendSegment();
+  return plan;
+}
+
+export async function runScriptCommands(commands, send) {
+  try {
+    for (const packet of planScriptCommands(commands)) {
+      await send(packet.commandType, packet.payload);
+    }
+  } catch (error) {
+    try {
+      await send(CommandType.StopAll, new Uint8Array());
+    } catch {
+      // Preserve the original script error.
+    }
+    throw error;
+  }
+}
+
+function scriptCommandPacket(command) {
+  if (command.kind === "type") {
+    return { commandType: CommandType.TypeAscii, payload: asciiPayload(command.text) };
+  }
+  if (command.kind === "key") {
+    const commandType = {
+      tap: CommandType.KeyTap,
+      down: CommandType.KeyDown,
+      up: CommandType.KeyUp,
+    }[command.action];
+    return { commandType, payload: keyPayload(command.combo) };
+  }
+  if (command.kind === "mouse") {
+    if (command.action === "move") {
+      return {
+        commandType: CommandType.MouseMoveRel,
+        payload: i16PairPayload(command.dx, command.dy),
+      };
+    }
+    const commandType = {
+      click: CommandType.MouseClick,
+      down: CommandType.MouseButtonDown,
+      up: CommandType.MouseButtonUp,
+      wheel: CommandType.MouseWheel,
+    }[command.action];
+    const value = command.action === "wheel" ? command.delta : command.button.mask;
+    return { commandType, payload: bytePayload(value) };
+  }
+  if (command.kind === "wait") {
+    return { commandType: CommandType.WaitMs, payload: u32Payload(command.ms) };
+  }
+  throw new Error(`unknown script command ${command.kind}`);
 }
 
 export function parseLine(line, lineNumber = 1) {
