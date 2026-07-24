@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: thumbv8m.main-none-eabihf
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test firmware library on Windows host
+        run: cargo test --target x86_64-pc-windows-msvc --lib
+
+      - name: Lint release firmware
+        run: cargo clippy --release -- -D warnings
+
+      - name: Build release firmware
+        run: cargo build --release
+
+      - name: Test hidctl
+        run: cargo test --manifest-path tools/hidctl/Cargo.toml --target x86_64-pc-windows-msvc
+
+      - name: Test WebUI protocol
+        run: node --test tools/webui/tests/protocol.test.mjs
+
+      - name: Test Python SDK
+        run: uv run --project sdk/python python -m unittest discover -s sdk/python/tests -v
+
+      - name: Configure C++ SDK tests
+        run: cmake -S sdk/cpp -B sdk/cpp/build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build C++ SDK tests
+        run: cmake --build sdk/cpp/build --config Release
+
+      - name: Test C++ SDK
+        run: ctest --test-dir sdk/cpp/build -C Release --output-on-failure
