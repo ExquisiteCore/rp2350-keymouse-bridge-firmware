@@ -38,6 +38,20 @@ pub trait ExecutionBackend {
     ) -> Result<(), ErrorCode>;
 }
 
+async fn send_relative_mouse_step<B: ExecutionBackend>(
+    backend: &mut B,
+    state: MouseState,
+    x: i8,
+    y: i8,
+) -> Result<(), ErrorCode> {
+    if x == 0 && y > 0 {
+        backend.send_mouse(state, 1, y, 0).await?;
+        backend.send_mouse(state, -1, 0, 0).await
+    } else {
+        backend.send_mouse(state, x, y, 0).await
+    }
+}
+
 /// Executes one decoded command and best-effort releases interrupted HID state.
 pub async fn execute_command<B: ExecutionBackend>(
     command: Command<'_>,
@@ -105,7 +119,7 @@ pub(crate) async fn execute_command_once<B: ExecutionBackend>(
         Command::MouseMoveRel { dx, dy } => {
             for (x, y) in RelativeMovementSteps::new(dx, dy) {
                 backend.check_cancelled()?;
-                backend.send_mouse(state.mouse, x, y, 0).await?;
+                send_relative_mouse_step(backend, state.mouse, x, y).await?;
                 backend.check_cancelled()?;
             }
             DeviceResponse::Ack

@@ -240,6 +240,134 @@ mod execution_core_tests {
         }
     }
 
+    fn mouse_report(x: i8, y: i8) -> Report {
+        mouse_report_with_state(MouseState::new(), x, y)
+    }
+
+    fn mouse_report_with_state(state: MouseState, x: i8, y: i8) -> Report {
+        Report::Mouse {
+            state,
+            x,
+            y,
+            wheel: 0,
+        }
+    }
+
+    #[test]
+    fn pure_positive_y_uses_balanced_horizontal_compatibility_reports() {
+        let mut backend = FakeExecutionBackend::cancelling_after_report(usize::MAX);
+        let mut state = InputState::new();
+
+        let result = run_ready(execute_command(
+            Command::MouseMoveRel { dx: 0, dy: 80 },
+            2,
+            false,
+            &mut backend,
+            &mut state,
+        ));
+
+        assert_eq!(result, Ok(DeviceResponse::Ack));
+        assert_eq!(backend.reports, [mouse_report(1, 80), mouse_report(-1, 0)]);
+    }
+
+    #[test]
+    fn pure_positive_y_preserves_held_mouse_buttons_in_both_reports() {
+        let mut backend = FakeExecutionBackend::cancelling_after_report(usize::MAX);
+        let mut state = InputState::new();
+        state.mouse.button_down(MouseButton::Right);
+        let held = state.mouse;
+
+        let result = run_ready(execute_command(
+            Command::MouseMoveRel { dx: 0, dy: 80 },
+            2,
+            false,
+            &mut backend,
+            &mut state,
+        ));
+
+        assert_eq!(result, Ok(DeviceResponse::Ack));
+        assert_eq!(
+            backend.reports,
+            [
+                mouse_report_with_state(held, 1, 80),
+                mouse_report_with_state(held, -1, 0),
+            ]
+        );
+        assert_eq!(state.mouse, held);
+    }
+
+    #[test]
+    fn pure_positive_y_chunks_keep_zero_net_x_and_full_y() {
+        let mut backend = FakeExecutionBackend::cancelling_after_report(usize::MAX);
+        let mut state = InputState::new();
+
+        let result = run_ready(execute_command(
+            Command::MouseMoveRel { dx: 0, dy: 300 },
+            2,
+            false,
+            &mut backend,
+            &mut state,
+        ));
+
+        assert_eq!(result, Ok(DeviceResponse::Ack));
+        assert_eq!(
+            backend.reports,
+            [
+                mouse_report(1, 127),
+                mouse_report(-1, 0),
+                mouse_report(1, 127),
+                mouse_report(-1, 0),
+                mouse_report(1, 46),
+                mouse_report(-1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn negative_y_and_mixed_xy_keep_single_reports() {
+        for (command, expected) in [
+            (
+                Command::MouseMoveRel { dx: 0, dy: -80 },
+                mouse_report(0, -80),
+            ),
+            (Command::MouseMoveRel { dx: 1, dy: 80 }, mouse_report(1, 80)),
+        ] {
+            let mut backend = FakeExecutionBackend::cancelling_after_report(usize::MAX);
+            let mut state = InputState::new();
+
+            let result = run_ready(execute_command(command, 2, false, &mut backend, &mut state));
+
+            assert_eq!(result, Ok(DeviceResponse::Ack));
+            assert_eq!(backend.reports, [expected]);
+        }
+    }
+
+    #[test]
+    fn pure_positive_y_finishes_compensation_before_observing_cancellation() {
+        let mut backend = FakeExecutionBackend::cancelling_after_report(1);
+        let mut state = InputState::new();
+
+        let result = run_ready(execute_command(
+            Command::MouseMoveRel { dx: 0, dy: 80 },
+            2,
+            false,
+            &mut backend,
+            &mut state,
+        ));
+
+        assert_eq!(result, Err(ErrorCode::Cancelled));
+        assert_eq!(
+            backend.reports,
+            [
+                mouse_report(1, 80),
+                mouse_report(-1, 0),
+                Report::Keyboard(KeyboardState::new()),
+                mouse_report(0, 0),
+            ]
+        );
+        assert!(state.is_idle());
+    }
+
     fn assert_direct_batch_marker_is_rejected_without_hid_effect(command: Command<'_>) {
         let mut backend = FakeExecutionBackend::cancelling_after_report(usize::MAX);
         let mut state = InputState::new();
