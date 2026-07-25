@@ -38,6 +38,7 @@ sdk/python -> https://github.com/ExquisiteCore/rp2350-hid-bridge-python
 ```text
 Rust stable with edition 2024 support
 rustup target thumbv8m.main-none-eabihf
+elf2uf2-rs for UF2 packaging
 picotool for USB flashing
 Visual Studio 2022 Build Tools for Windows host tools
 ```
@@ -46,6 +47,7 @@ Install the embedded target:
 
 ```powershell
 rustup target add thumbv8m.main-none-eabihf
+cargo install elf2uf2-rs --locked
 ```
 
 ## Build Firmware
@@ -68,6 +70,34 @@ target\thumbv8m.main-none-eabihf\release\rp2350-keymouse-bridge-firmware
 The root package is a firmware binary. `Cargo.lock` is intentionally committed
 for reproducible firmware builds.
 
+### Build a BOOTSEL UF2
+
+Run the release wrapper to compile the firmware and package a Pico 2 UF2 in one
+step:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-release.ps1
+```
+
+Outputs:
+
+```text
+target\thumbv8m.main-none-eabihf\release\rp2350-keymouse-bridge-firmware
+dist\rp2350-keymouse-bridge-firmware.uf2
+```
+
+The wrapper resolves `elf2uf2-rs` from `PATH`, or from the executable path in
+`ELF2UF2_PATH`. It validates every UF2 block and writes the RP2350 ARM Secure
+family ID `0xE48BFF59`; do not use an uncorrected RP2040-family UF2 on Pico 2.
+The script prints the UF2 SHA-256 digest and does not flash a board, open a
+serial port, or emit HID input.
+
+Run its integration check with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/tests/build-release-uf2.ps1
+```
+
 ### USB identity
 
 Development builds default to USB VID/PID `0xCAFE:0x2350`. Override either ID
@@ -88,7 +118,7 @@ each chip a stable identity for CDC/HID enumeration. The current code has no
 shared or fabricated fallback serial: if `embassy_rp::otp::get_chipid()` fails,
 startup panics before USB enumeration.
 
-## Run Host-Side Tests
+## Automated Verification
 
 Pure protocol and parser tests can run on the Windows host:
 
@@ -96,9 +126,24 @@ Pure protocol and parser tests can run on the Windows host:
 cargo test --target x86_64-pc-windows-msvc --lib
 ```
 
-These tests use pure state machines and fake transports. Automated tests must
-never flash firmware, select a serial device, or emit real HID input; hardware
-acceptance is a separate, manually approved procedure.
+The complete hardware-free verification used by CI is:
+
+```powershell
+cargo fmt --all -- --check
+cargo test --target x86_64-pc-windows-msvc --lib
+cargo clippy --release -- -D warnings
+cargo build --release
+cargo test --manifest-path tools/hidctl/Cargo.toml --target x86_64-pc-windows-msvc
+node --test tools/webui/tests/protocol.test.mjs
+uv run --project sdk/python python -m unittest discover -s sdk/python/tests -v
+cmake -S sdk/cpp -B sdk/cpp/build -G "Visual Studio 17 2022" -A x64
+cmake --build sdk/cpp/build --config Release
+ctest --test-dir sdk/cpp/build -C Release --output-on-failure
+```
+
+These commands use pure state machines and fake transports. They never flash
+firmware, select a serial device, or emit real HID input; hardware acceptance
+is a separate, explicitly initiated procedure.
 
 ## Flash Firmware
 
@@ -179,6 +224,31 @@ Run a script:
 .\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 run examples\hidctl-demo.txt
 ```
 
+### Manual hardware acceptance
+
+Rebuild `hidctl` after firmware or protocol changes so the host tool and board
+use the same wire format. Start with commands that do not emit HID input:
+
+```powershell
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe list
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 ping
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 info
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 caps
+```
+
+Only in a controlled active desktop, perform a small real-input check and end
+with an explicit release:
+
+```powershell
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 mouse move 20 0
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 mouse move -20 0
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 stop
+```
+
+For safety-lifecycle acceptance, hold modifier-only input through an SDK,
+terminate that client, and verify the host observes automatic release. This is
+intentionally manual because it opens a real serial port and emits real HID.
+
 ## SDK Usage
 
 C++ SDK:
@@ -193,12 +263,12 @@ cmake --build build --config Release
 Python SDK:
 
 ```powershell
-cd sdk\python
-python -m venv .venv
-.\.venv\Scripts\python -m pip install -U pip
-.\.venv\Scripts\python -m pip install -e .
-.\.venv\Scripts\python -m unittest discover -s tests
+uv sync --project sdk/python
+uv run --project sdk/python python -m unittest discover -s sdk/python/tests -v
 ```
+
+See `sdk/cpp/README.md` and `sdk/python/README.md` for protocol-v2 retry,
+concurrency, close/reopen, heartbeat, and script-session guarantees.
 
 ## Protocol and safety summary
 
@@ -265,6 +335,5 @@ Error triple blink       invalid command or protocol error
 ## Notes
 
 The firmware emits real USB HID input. Use host tools and SDK examples only when
-the active host environment is expected. The verification documented for this
-change is build-only plus `tools/flash.ps1 -ResolveOnly`; it does not flash a
-board or send serial/HID commands.
+the active host environment is expected. CI remains hardware-free; flashing and
+the manual acceptance procedure above are separate, explicit actions.
