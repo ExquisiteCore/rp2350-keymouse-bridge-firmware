@@ -230,8 +230,14 @@ Ping 板卡：
 ```powershell
 .\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 mouse move 20 0
 .\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 mouse move -20 0
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 mouse move 0 20
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 mouse move 0 -20
+.\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 mouse move 1 20
 .\tools\hidctl\target\x86_64-pc-windows-msvc\release\hidctl.exe --port COM3 stop
 ```
+
+四个纯轴方向必须都产生幅度近似对称的光标位移。`mouse move 0 20` 若不移动、但
+`mouse move 1 20` 可以移动，说明纯正向 Y HID 报告路径仍未通过验收。
 
 进行安全生命周期验收时，通过 SDK 保持一个纯修饰键输入，然后终止该客户端，并确认
 主机观察到自动释放。该流程会打开真实串口并产生真实 HID，因此有意要求手动执行。
