@@ -44,7 +44,7 @@ jobs:
         run: uv run --project sdk/python python -m unittest discover -s sdk/python/tests -v
 
       - name: Configure C++ SDK tests
-        run: cmake -S sdk/cpp -B sdk/cpp/build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S sdk/cpp -B sdk/cpp/build
 
       - name: Build C++ SDK tests
         run: cmake --build sdk/cpp/build --config Release
