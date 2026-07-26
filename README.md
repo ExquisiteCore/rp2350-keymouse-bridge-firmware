@@ -19,7 +19,7 @@ src/                  RP2350 固件源码
 tools/hidctl/         用于协议检查的 Windows 主机 CLI
 tools/webui/          Web Serial 协议/调试界面
 tools/flash.ps1       显式调用 picotool 的脚本，支持安全的仅解析模式
-sdk/cpp/              C++17 仅头文件 SDK 子模块
+sdk/cpp/              C++17 共享库 SDK 子模块
 sdk/python/           Python SDK 子模块
 .cargo/config.toml    RP2350 目标和 picotool runner 配置
 rp2350.x              链接脚本
@@ -243,6 +243,15 @@ Ping 板卡：
 主机观察到自动释放。该流程会打开真实串口并产生真实 HID，因此有意要求手动执行。
 
 ## SDK 使用
+
+生产调用统一通过 `rp2350_hid_bridge.dll` 的稳定 C ABI。C++ `HidSession` 是该 C ABI
+的 RAII 包装，Python `HidSession` 是同一 DLL 的 `ctypes` 包装；两边都不再各自实现
+串口协议、心跳或响应读取。
+
+一个 COM 口只能由一个原生 session 拥有。主控先创建并打开 session，其他组件只能
+retain/attach 同一个不透明句柄，不能再用 pyserial、hidctl 或第二个 SDK 实例同时打开
+该 COM。全局释放由 session 所有者显式执行 `stop_all()`；最后一个引用释放时 DLL 才
+停止心跳、取消 DTR 并关闭端口。
 
 C++ SDK：
 
